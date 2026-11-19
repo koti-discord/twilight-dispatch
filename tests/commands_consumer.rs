@@ -688,7 +688,9 @@ async fn messages_are_posted_once_without_mentions() {
 
     let (posted, failed) = (messages("posted"), messages("failed"));
     let embeds = json!([{"title": "Thanks", "description": "<@&1> @here"}]);
-    let data = json!({"channel_id": "42", "content": "Hi @everyone", "embeds": embeds});
+    let mut data = json!({"channel_id": "42", "content": "Hi @everyone", "embeds": embeds});
+    let link = json!({"type": 2, "style": 5, "label": "Stats", "url": "https://example.com"});
+    data["components"] = json!([{"type": 1, "components": [link]}]);
     let welcome = json!({"op": 2, "shard": 7, "data": data});
     send_command(&url, welcome.to_string().as_bytes()).await;
     let refused = json!({"op": 2, "data": {"channel_id": 43, "content": "Hi"}});
@@ -699,6 +701,10 @@ async fn messages_are_posted_once_without_mentions() {
     assert_eq!(posts[0]["embeds"][0]["title"], "Thanks");
     assert_eq!(posts[0]["embeds"][0]["type"], "rich");
     assert_eq!(posts[0]["allowed_mentions"], json!({"parse": []}));
+    let button = &posts[0]["components"][0]["components"][0];
+    assert_eq!(button["style"], 5);
+    assert_eq!(button["label"], "Stats");
+    assert_eq!(button["url"], "https://example.com");
     fake.api.wait_posts(43, 1).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while messages("posted") + messages("failed") < posted + failed + 2 {

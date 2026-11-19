@@ -14,9 +14,10 @@
 //! process consumes it posts it, through the one REST request a delivery can
 //! make (create message, `POST /channels/{id}/messages`), with every mention
 //! suppressed. Its content and embeds are checked against Discord's limits
-//! first, with twilight-validate (the checks twilight-http makes). A message
-//! that Discord rejects anyway, or whose request fails, is logged and
-//! dropped, never retried: Discord may have posted it all the same.
+//! first, with twilight-validate (the checks twilight-http makes), and so are
+//! its buttons, which may only be link buttons. A message that Discord
+//! rejects anyway, or whose request fails, is logged and dropped, never
+//! retried: Discord may have posted it all the same.
 
 use crate::{
     amqp::{declare_consume, Amqp},
@@ -42,8 +43,9 @@ use twilight_gateway::CloseFrame;
 use twilight_http::Client;
 use twilight_model::{
     channel::message::{
+        component::{ActionRow, Button, ButtonStyle},
         embed::{EmbedAuthor, EmbedField, EmbedFooter, EmbedImage, EmbedThumbnail},
-        AllowedMentions, Embed,
+        AllowedMentions, Component, Embed,
     },
     id::{marker::ChannelMarker, Id},
     util::Timestamp,
@@ -132,6 +134,11 @@ pub enum InvalidCommand {
     /// field name 256 and value 1024, footer 2048, author name 256, 6000 in
     /// all) or a color above `0xFFFFFF`; holds twilight-validate's reason.
     InvalidEmbeds(String),
+    /// A message whose buttons are not link buttons, or that Discord would
+    /// reject: more than 5 rows, a row of no buttons or more than 5, a label
+    /// of no characters or more than 80, or a URL that is not `http`, `https`
+    /// or `discord` or is over 512 characters; holds the reason.
+    InvalidButtons(String),
 }
 
 impl std::fmt::Display for InvalidCommand {
@@ -156,6 +163,7 @@ impl std::fmt::Display for InvalidCommand {
                 )
             }
             Self::InvalidEmbeds(reason) => write!(f, "embeds over Discord's limits: {reason}"),
+            Self::InvalidButtons(reason) => write!(f, "invalid buttons: {reason}"),
         }
     }
 }
@@ -225,8 +233,8 @@ struct MessageDelivery {
     data: MessageData,
 }
 
-/// The `data` of a message delivery. Other fields (`tts`, `components`...)
-/// are rejected: they are not supported.
+/// The `data` of a message delivery. Other fields (`tts`, `flags`...) are
+/// rejected: they are not supported.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MessageData {
@@ -236,6 +244,112 @@ struct MessageData {
     content: Option<String>,
     /// Discord embed objects; `None` (missing or `null`) is the same as none.
     embeds: Option<Vec<MessageEmbed>>,
+    /// Rows of link buttons; `None` (missing or `null`) is the same as none.
+    components: Option<Vec<MessageRow>>,
+}
+
+/// A row of buttons under a message, as Discord documents its action row:
+/// `{"type": 1, "components": [...]}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageRow {
+    /// The component type: 1, an action row.
+    #[serde(rename = "type")]
+    kind: u8,
+    /// The buttons of the row.
+    components: Vec<LinkButton>,
+}
+
+/// A link button, as Discord documents it:
+/// `{"type": 2, "style": 5, "label": "...", "url": "https://..."}`. Only
+/// links: a button of another style sends an interaction, which nothing
+/// here answers.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkButton {
+    /// The component type: 2, a button.
+    #[serde(rename = "type")]
+    kind: u8,
+    /// The button style: 5, a link.
+    style: u8,
+    /// The text on the button.
+    label: String,
+    /// What the button opens.
+    url: String,
+}
+
+/// The most rows of buttons under a message.
+const MAX_ROWS: usize = 5;
+
+/// The most buttons in a row.
+const MAX_BUTTONS: usize = 5;
+
+/// The longest label of a button, in characters.
+const LABEL_LENGTH_MAX: usize = 80;
+
+/// The longest URL of a link button, in characters.
+const URL_LENGTH_MAX: usize = 512;
+
+/// The schemes a link button may open.
+const LINK_SCHEMES: [&str; 3] = ["https://", "http://", "discord://"];
+
+/// The rows of link buttons of a message, checked against Discord's limits:
+/// at most [`MAX_ROWS`] rows (`type` 1) of 1 to [`MAX_BUTTONS`] buttons
+/// (`type` 2, `style` 5), each with a label of 1 to [`LABEL_LENGTH_MAX`]
+/// characters and an `http`, `https` or `discord` URL of at most
+/// [`URL_LENGTH_MAX`].
+fn link_rows(rows: Vec<MessageRow>) -> Result<Vec<Component>, String> {
+    if rows.len() > MAX_ROWS {
+        return Err(format!("more than {MAX_ROWS} rows"));
+    }
+    rows.into_iter().map(link_row).collect()
+}
+
+/// One row of link buttons (see [`link_rows`]).
+fn link_row(row: MessageRow) -> Result<Component, String> {
+    if row.kind != 1 {
+        return Err(format!("component type {} is not a row", row.kind));
+    }
+    if !(1..=MAX_BUTTONS).contains(&row.components.len()) {
+        return Err(format!("a row needs 1 to {MAX_BUTTONS} buttons"));
+    }
+    let mut buttons = Vec::with_capacity(row.components.len());
+    for button in row.components {
+        buttons.push(link_button(button)?);
+    }
+    Ok(Component::ActionRow(ActionRow {
+        id: None,
+        components: buttons,
+    }))
+}
+
+/// One link button (see [`link_rows`]).
+fn link_button(button: LinkButton) -> Result<Component, String> {
+    if button.kind != 2 {
+        return Err(format!("component type {} is not a button", button.kind));
+    }
+    if button.style != 5 {
+        return Err(format!("button style {} is not a link", button.style));
+    }
+    if !(1..=LABEL_LENGTH_MAX).contains(&button.label.chars().count()) {
+        return Err(format!("a label needs 1 to {LABEL_LENGTH_MAX} characters"));
+    }
+    if !LINK_SCHEMES.iter().any(|s| button.url.starts_with(s)) {
+        return Err("a button URL is not http, https or discord".to_owned());
+    }
+    if button.url.chars().count() > URL_LENGTH_MAX {
+        return Err(format!("a button URL is over {URL_LENGTH_MAX} characters"));
+    }
+    Ok(Component::Button(Button {
+        id: None,
+        custom_id: None,
+        disabled: false,
+        emoji: None,
+        label: Some(button.label),
+        style: ButtonStyle::Link,
+        url: Some(button.url),
+        sku_id: None,
+    }))
 }
 
 /// An embed of a message, as Discord documents its embed object. Fields that
@@ -313,15 +427,18 @@ pub struct ChannelMessage {
     pub content: String,
     /// At most 10 embeds, all of type "rich".
     pub embeds: Vec<Embed>,
+    /// Rows of link buttons under the message; none when empty.
+    pub components: Vec<Component>,
 }
 
 /// Parse and validate a message delivery (one [`is_message`] accepts):
-/// `{"op": 2, "data": {"channel_id": "123", "content": "...", "embeds": [...]}}`.
+/// `{"op": 2, "data": {"channel_id": "123", "content": "...", "embeds": [...],
+/// "components": [...]}}`.
 ///
-/// `channel_id` is a snowflake (a string or a number), `content` text and
-/// `embeds` Discord embed objects; either may be missing or `null`. Other
-/// fields of `data` are rejected, and those of the delivery (a `shard`) are
-/// not read.
+/// `channel_id` is a snowflake (a string or a number), `content` text,
+/// `embeds` Discord embed objects and `components` rows of link buttons; any
+/// of the last three may be missing or `null`. Other fields of `data` are
+/// rejected, and those of the delivery (a `shard`) are not read.
 ///
 /// # Errors
 ///
@@ -331,8 +448,9 @@ pub struct ChannelMessage {
 /// time...), [`InvalidCommand::EmptyMessage`] when there are no embeds and
 /// the content is missing, empty or only whitespace,
 /// [`InvalidCommand::ContentTooLong`] when the content is over 2000
-/// characters and [`InvalidCommand::InvalidEmbeds`] when the embeds are over
-/// Discord's limits.
+/// characters, [`InvalidCommand::InvalidEmbeds`] when the embeds are over
+/// Discord's limits and [`InvalidCommand::InvalidButtons`] when the buttons
+/// are not link buttons within Discord's limits.
 pub fn parse_message(body: &[u8]) -> Result<ChannelMessage, InvalidCommand> {
     let malformed = |err: serde_json::Error| InvalidCommand::Malformed(err.to_string());
     let delivery: MessageDelivery = serde_json::from_slice(body).map_err(malformed)?;
@@ -350,10 +468,13 @@ pub fn parse_message(body: &[u8]) -> Result<ChannelMessage, InvalidCommand> {
         let reason = format!("{err} ({:?})", err.kind());
         return Err(InvalidCommand::InvalidEmbeds(reason));
     }
+    let components = link_rows(data.components.unwrap_or_default());
+    let components = components.map_err(InvalidCommand::InvalidButtons)?;
     Ok(ChannelMessage {
         channel_id: data.channel_id,
         content,
         embeds,
+        components,
     })
 }
 
@@ -479,6 +600,9 @@ pub async fn post(client: &Client, message: &ChannelMessage) {
     }
     if !message.embeds.is_empty() {
         request = request.embeds(&message.embeds);
+    }
+    if !message.components.is_empty() {
+        request = request.components(&message.components);
     }
     let Err(err) = request.await else {
         GATEWAY_COMMANDS.with_label_values(&["", "posted"]).inc();
@@ -852,6 +976,7 @@ mod tests {
             InvalidCommand::EmptyMessage,
             InvalidCommand::ContentTooLong(2001),
             InvalidCommand::InvalidEmbeds("message has too many embeds".into()),
+            InvalidCommand::InvalidButtons("a row needs 1 to 5 buttons".into()),
         ]
         .iter()
         .map(ToString::to_string)
@@ -872,6 +997,7 @@ mod tests {
             "{reasons:?}"
         );
         assert!(reasons[8].ends_with("too many embeds"), "{reasons:?}");
+        assert!(reasons[9].ends_with("1 to 5 buttons"), "{reasons:?}");
     }
 
     #[test]
@@ -935,6 +1061,25 @@ mod message_tests {
 
     fn invalid_embeds(data: Value) -> bool {
         matches!(parse_data(data), Err(InvalidCommand::InvalidEmbeds(_)))
+    }
+
+    fn invalid_buttons(data: Value) -> bool {
+        matches!(parse_data(data), Err(InvalidCommand::InvalidButtons(_)))
+    }
+
+    /// A link button.
+    fn button(label: &str, url: &str) -> Value {
+        json!({"type": 2, "style": 5, "label": label, "url": url})
+    }
+
+    /// The `data` of a message with an embed and these rows of buttons.
+    fn with_rows(rows: Value) -> Value {
+        json!({"channel_id": "1", "embeds": [{"title": "t"}], "components": rows})
+    }
+
+    /// The `data` of a message with an embed and a row of this button.
+    fn with_button(button: Value) -> Value {
+        with_rows(json!([{"type": 1, "components": [button]}]))
     }
 
     /// What the bot posts when it joins a guild: content and an embed as
@@ -1081,8 +1226,94 @@ mod message_tests {
         assert!(invalid_embeds(data));
     }
 
+    /// What the bot posts under its join message: a row of link buttons,
+    /// posted as it was sent.
+    #[test]
+    fn link_buttons_are_posted_as_they_were_sent() {
+        let overview = button("View Server Stats", "https://example.com/1/overview");
+        let support = button("Support Server", "https://discord.gg/abc");
+        let rows = json!([{"type": 1, "components": [overview, support]}]);
+        let message = parse_data(with_rows(rows)).unwrap();
+        assert_eq!(message.components.len(), 1);
+
+        let posted = serde_json::to_value(&message.components).unwrap();
+        assert_eq!(posted[0]["type"], 1);
+        let buttons = &posted[0]["components"];
+        assert_eq!(buttons.as_array().map(Vec::len), Some(2));
+        assert_eq!(buttons[0]["type"], 2);
+        assert_eq!(buttons[0]["style"], 5);
+        assert_eq!(buttons[0]["label"], "View Server Stats");
+        assert_eq!(buttons[0]["url"], "https://example.com/1/overview");
+        assert_eq!(buttons[1]["label"], "Support Server");
+        assert_eq!(buttons[1]["url"], "https://discord.gg/abc");
+
+        let data = json!({"channel_id": "1", "content": "hi", "components": null});
+        assert!(parse_data(data).unwrap().components.is_empty());
+    }
+
+    /// Buttons Discord would refuse, and buttons that are not links (nothing
+    /// here answers the interactions the others send), are dropped before
+    /// any request is made; up to the limits they are posted.
+    #[test]
+    fn only_link_buttons_within_discords_limits_are_posted() {
+        let link = button("l", "https://example.com");
+        let row = |count: usize| json!({"type": 1, "components": vec![link.clone(); count]});
+        let rows = |count: usize, buttons: usize| json!(vec![row(buttons); count]);
+        assert!(parse_data(with_rows(rows(5, 5))).is_ok());
+        assert!(parse_data(with_rows(rows(0, 1))).is_ok());
+        for (count, buttons) in [(6, 1), (1, 0), (1, 6)] {
+            let data = with_rows(rows(count, buttons));
+            assert!(invalid_buttons(data.clone()), "{data}");
+        }
+
+        let label = "l".repeat(LABEL_LENGTH_MAX);
+        let url = format!("https://example.com/{}", "u".repeat(492));
+        assert_eq!(url.len(), URL_LENGTH_MAX);
+        let within = [
+            button(&label, "https://example.com"),
+            button("l", &url),
+            button("l", "http://example.com"),
+            button("l", "discord://-/channels/1/2"),
+        ];
+        for link in within {
+            let data = with_button(link);
+            assert!(parse_data(data.clone()).is_ok(), "{data}");
+        }
+        let over = [
+            button("", "https://example.com"),
+            button(&format!("{label}l"), "https://example.com"),
+            button("l", &format!("{url}u")),
+            button("l", "ftp://example.com"),
+            button("l", "example.com"),
+            json!({"type": 2, "style": 1, "label": "l", "url": "https://example.com"}),
+            json!({"type": 3, "style": 5, "label": "l", "url": "https://example.com"}),
+        ];
+        for link in over {
+            let data = with_button(link);
+            assert!(invalid_buttons(data.clone()), "{data}");
+        }
+        let data = with_rows(json!([{"type": 4, "components": [button("l", "https://x.y")]}]));
+        assert!(invalid_buttons(data));
+    }
+
+    /// A button has a label and a URL and nothing else (no `custom_id`,
+    /// `emoji`...), and a row has its buttons.
+    #[test]
+    fn buttons_of_another_shape_are_malformed() {
+        let mut custom = button("l", "https://example.com");
+        custom["custom_id"] = json!("c");
+        let mut unlabelled = button("l", "https://example.com");
+        unlabelled.as_object_mut().unwrap().remove("label");
+        for link in [custom, unlabelled, json!("l")] {
+            let data = with_button(link);
+            assert!(is_malformed(data.clone()), "{data}");
+        }
+        assert!(is_malformed(with_rows(json!([{"type": 1}]))));
+        assert!(is_malformed(with_rows(json!({"type": 1}))));
+    }
+
     /// `data` must be of the documented shape. What the consumer does not
-    /// support (`tts`, `components`...) is rejected rather than ignored.
+    /// support (`tts`, `flags`...) is rejected rather than ignored.
     #[test]
     fn other_shapes_are_malformed() {
         let malformed = [

@@ -15,8 +15,8 @@ Only the gateway opcodes 3, 4, 8, 31 and 43 may be sent, and `data` (as
 compact JSON) may be at most 4096 bytes; other commands, and commands for a
 shard the bot does not have, are dropped and counted in
 `gateway_commands{result="invalid"}`. `{"op": 2, "data": {"channel_id": ...,
-"content": ..., "embeds": [...]}}` on `gateway.send` posts a message to a
-channel through Discord's REST API (see Operations).
+"content": ..., "embeds": [...], "components": [...]}}` on `gateway.send`
+posts a message to a channel through Discord's REST API (see Operations).
 
 Configuration is read from environment variables (or `.env`); see
 [`.env.example`](.env.example).
@@ -169,17 +169,24 @@ Configuration is read from environment variables (or `.env`); see
   through Discord's REST API, with the bot's token (create message,
   `POST /channels/{id}/messages`; no other request can be made this way):
   `{"op": 2, "data": {"channel_id": "123456789012345678", "content": "text",
-  "embeds": [{"title": "..."}]}}`. It is for no shard: the process that
-  consumes it posts it, and a `shard` it has is ignored. `channel_id` is a
-  snowflake (a string or a number). `content` and `embeds` (Discord embed
-  objects; `type`, `provider` and `video` are ignored, and `timestamp` may be
-  any RFC 3339 time) may be missing or `null`, but a message needs embeds or
-  content that is not blank. Any other field in `data` (`tts`, `components`,
-  ...) makes the delivery invalid. The content may be at most 2000
+  "embeds": [{"title": "..."}], "components": [{"type": 1, "components":
+  [{"type": 2, "style": 5, "label": "...", "url": "https://..."}]}]}}`. It
+  is for no shard: the process that consumes it posts it, and a `shard` it
+  has is ignored. `channel_id` is a snowflake (a string or a number).
+  `content`, `embeds` (Discord embed objects; `type`, `provider` and `video`
+  are ignored, and `timestamp` may be any RFC 3339 time) and `components`
+  (rows of link buttons) may be missing or `null`, but a message needs
+  embeds or content that is not blank. Any other field in `data` (`tts`,
+  `flags`, ...) makes the delivery invalid. The content may be at most 2000
   characters, and there may be at most 10 embeds within Discord's limits
   (title 256 characters, description 4096, 25 fields, field name 256 and
   value 1024, footer 2048, author name 256, 6000 in all the embeds of the
-  message, color at most `0xFFFFFF`), as twilight-http checks them. Mentions
+  message, color at most `0xFFFFFF`), as twilight-http checks them. Buttons
+  may only be link buttons (`type` 2, `style` 5, a `label` and a `url`,
+  nothing else): a button of another style sends an interaction, which
+  nothing here answers. There may be at most 5 rows (`type` 1) of 1 to 5
+  buttons, each label 1 to 80 characters and each URL `http`, `https` or
+  `discord` and at most 512 characters. Mentions
   are always suppressed (`"allowed_mentions": {"parse": []}`), so a message
   never pings `@everyone`, a role or a user. Invalid messages are dropped
   like invalid commands (a warning at most every 5 s,
