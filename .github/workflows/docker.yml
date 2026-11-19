@@ -276,3 +276,26 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Roll the swarm service onto the image just pushed: the Portainer service
+  # webhook in the DEPLOY_WEBHOOK_URL secret redeploys it, pulling :latest.
+  # Only a push to main deploys, once its image is built and pushed; tags and
+  # pull requests do not.
+  deploy:
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    timeout-minutes: 5
+    permissions: {}
+
+    steps:
+      - name: Trigger Portainer redeploy
+        env:
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_WEBHOOK_URL" ]; then
+            echo "The DEPLOY_WEBHOOK_URL secret is not set"
+            exit 1
+          fi
+          curl -fsS --retry 3 --max-time 30 -X POST "$DEPLOY_WEBHOOK_URL"
