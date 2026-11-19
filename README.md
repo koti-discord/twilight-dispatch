@@ -252,7 +252,10 @@ runs the tests under `cargo llvm-cov`, adds the per-file line coverage of
 uploads `lcov.info` as an artifact and fails when the line coverage of `src/`
 drops below 97%. The image is only built and published
 (self-hosted runner) for pushes to `main` and tags, after the format, clippy
-and test jobs passed. Actions are pinned to commits and kept current by
+and test jobs passed. Once a push to `main` has published its image, the
+deploy job POSTs the Portainer service webhook in the `DEPLOY_WEBHOOK_URL`
+secret, which redeploys the swarm service onto `:latest`; tags do not deploy.
+Actions are pinned to commits and kept current by
 Dependabot (`.github/dependabot.yml`), which also proposes crate updates
 except for the twilight crates.
 
