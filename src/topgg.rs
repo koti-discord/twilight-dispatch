@@ -274,8 +274,8 @@ pub async fn post_once<C: ConnectionLike + Send>(
             warn!("top.gg rate limited the stats, retry after {wait:?}");
             Some(wait)
         }
-        Ok(Outcome::Rejected(status, detail)) => {
-            warn!("top.gg rejected the stats ({status}): {detail}");
+        Ok(Outcome::Rejected(code, detail)) => {
+            warn!("top.gg rejected the stats ({code}): {detail}");
             None
         }
         Err(err) => {
