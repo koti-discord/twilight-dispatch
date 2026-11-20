@@ -5,7 +5,8 @@
 //! events, which update the cache ([`cache`]) and are published to the broker
 //! ([`amqp`]); gateway commands from the broker are sent to their shard
 //! ([`commands`]); [`metrics`] serves the Prometheus metrics and the health
-//! check. The README describes the data formats and operations.
+//! check, and [`topgg`] posts the bot's stats to top.gg. The README describes
+//! the data formats and operations.
 
 #![forbid(unsafe_code)]
 // Lints for the service code. Test code (the unit test modules and tests/)
@@ -42,4 +43,5 @@ pub mod metrics;
 mod model_patches;
 pub mod models;
 pub mod redis_conn;
+pub mod topgg;
 pub mod util;

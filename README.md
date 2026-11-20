@@ -222,6 +222,19 @@ Configuration is read from environment variables (or `.env`); see
   within 2 s, the shard identifies with that spacing only (logged once until
   Redis answers again). Each process still keeps the daily session start
   limit for its own shards.
+- With `TOPGG_TOKEN` (a top.gg project token) the process that runs shard 0
+  posts the bot's stats to top.gg (`PATCH
+  https://top.gg/api/v1/projects/@me/metrics`, `Authorization: Bearer
+  <token>`) every `TOPGG_INTERVAL_SECS` (900 by default, at least 60), the
+  first time one interval after the start: `{"server_count", "shard_count"}`,
+  the number of guilds in the state cache (`SCARD guild_keys`, shared by
+  every process, guilds in an outage included) and the shard total. It needs
+  `STATE_ENABLED` (a configuration error without it). An empty cache is not
+  posted, as 0 would replace the real count. A failed post (no answer within
+  30 s, or a status other than 2xx) is logged and not retried; a 429 holds
+  the next post back for its `Retry-After` header or `retry-after` body field
+  in seconds (an hour when it has neither, at most 6 hours), if that is
+  longer than the interval.
 
 ### Tests
 

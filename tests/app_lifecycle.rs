@@ -114,6 +114,7 @@ fn vars(fake: &FakeDiscord, redis_url: String, amqp_url: &str) -> Vars {
         ("LARGE_THRESHOLD", "100"),
         ("PROMETHEUS_HOST", "127.0.0.1"),
         ("WORKERS", "4"),
+        ("TOPGG_TOKEN", "app-lifecycle-topgg-token"),
     ]
     .into_iter()
     .map(|(name, value)| (name, value.to_owned()))

@@ -2135,6 +2135,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "insta",
  "lapin",

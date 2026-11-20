@@ -52,4 +52,5 @@ Config {
     shard_silence: 180s,
     discord_api_proxy: None,
     discord_gateway_url: None,
+    topgg: None,
 }
