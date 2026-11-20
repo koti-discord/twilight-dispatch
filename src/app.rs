@@ -16,7 +16,7 @@ use crate::{
     },
     metrics,
     models::{ApiResult, FormattedDateTime, SessionInfo},
-    redis_conn,
+    redis_conn, topgg,
     util::Throttle,
 };
 
@@ -194,6 +194,18 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
     ));
     background.spawn(sessions::run_job(redis.clone(), registry.clone()));
     background.spawn(expiry_job(redis.clone()));
+    // The process with shard 0 posts for the whole bot: every process counts
+    // the same guilds, from the cache they share.
+    if let Some(posting) = config.topgg.as_ref().filter(|_| range.start == 0) {
+        match topgg::Client::new(&posting.token) {
+            Ok(client) => {
+                let job = topgg::run_job(redis.clone(), client, range.total, posting.interval);
+                background.spawn(job);
+                info!("Posting stats to top.gg every {:?}", posting.interval);
+            }
+            Err(err) => warn!("Not posting stats to top.gg: {}", err),
+        }
+    }
 
     let discord = DiscordLog::new(http.clone(), config.log_channel, config.log_guild_channel);
     let worker_ctx = Arc::new(WorkerContext {

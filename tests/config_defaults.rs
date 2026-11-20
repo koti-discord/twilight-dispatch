@@ -64,6 +64,8 @@ const OPTIONAL: &[&str] = &[
     "DISCORD_GATEWAY_URL",
     "REQUEST_MEMBERS",
     "MEMBER_REFRESH_HOURS",
+    "TOPGG_TOKEN",
+    "TOPGG_INTERVAL_SECS",
 ];
 
 /// The configuration with exactly `vars` set (a later value wins).
@@ -130,6 +132,7 @@ fn unset_variables_take_their_documented_defaults() {
     assert_eq!(config.shard_silence, Duration::from_secs(180));
     assert_eq!(config.discord_api_proxy, None);
     assert_eq!(config.discord_gateway_url, None);
+    assert_eq!(config.topgg, None);
     // Off only for want of the GUILD_MEMBERS intent, which 513 lacks (see
     // `member_requests_default_to_the_guild_members_intent`).
     let members = MemberConfig {

@@ -104,6 +104,9 @@ pub struct Config {
     /// proxy). Resumes still go to Discord's resume URL. Trimmed and without
     /// a trailing `/`, as twilight appends `/?v=10&...`.
     pub discord_gateway_url: Option<String>,
+    /// Posting the bot's server and shard counts to top.gg (`TOPGG_TOKEN`,
+    /// `TOPGG_INTERVAL_SECS`); `None` when `TOPGG_TOKEN` is unset.
+    pub topgg: Option<TopggConfig>,
 }
 
 /// A REST proxy address as twilight-http takes it.
@@ -260,6 +263,27 @@ impl MemberConfig {
     }
 }
 
+/// Posting the bot's stats to top.gg (see [`crate::topgg`]). In one from
+/// [`Config::from_lookup`] `STATE_ENABLED` is on, as the server count is read
+/// from the state cache. `Debug` leaves the token out.
+#[derive(Clone, Eq, PartialEq)]
+pub struct TopggConfig {
+    /// The project token from the bot's top.gg settings (`TOPGG_TOKEN`),
+    /// trimmed.
+    pub token: String,
+    /// How often the stats are posted (`TOPGG_INTERVAL_SECS`, at least 60 s,
+    /// default 900 s).
+    pub interval: Duration,
+}
+
+impl fmt::Debug for TopggConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TopggConfig")
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The shards one process runs: `start..=end` of `total`. A range from
 /// [`Config::from_lookup`] is never empty: `start <= end < total`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,7 +332,8 @@ pub enum ConfigError {
         /// The value as set, except that the checks of a parsed number or flag
         /// report it (for `SHARDS_END`, the effective last shard) and that
         /// the credentials of a rejected `DISCORD_API_PROXY` or
-        /// `DISCORD_GATEWAY_URL` are replaced by `***`.
+        /// `DISCORD_GATEWAY_URL` are replaced by `***`, and a rejected
+        /// `TOPGG_TOKEN` is `***`.
         value: String,
         /// What is wrong with it, or which values are accepted.
         reason: String,
@@ -361,6 +386,7 @@ impl Config {
         let intents = env.intents()?;
         let large_threshold = env.large_threshold()?;
         let state = env.state()?;
+        let topgg = env.topgg(&state)?;
         let members = env.members(intents)?;
         let amqp_url = env.amqp_url()?;
         let redis_url = env.redis_url()?;
@@ -446,6 +472,7 @@ impl Config {
                 })?),
                 None => None,
             },
+            topgg,
         })
     }
 
@@ -616,6 +643,39 @@ impl Env<'_> {
             request: request.unwrap_or(has_intent),
             refresh_hours,
         })
+    }
+
+    /// `TOPGG_TOKEN` and `TOPGG_INTERVAL_SECS` (default 900, at least 60):
+    /// `None` without a token. The token is reported as `***`, and it needs
+    /// `STATE_ENABLED`, as the server count is read from the state cache.
+    fn topgg(&self, state: &StateConfig) -> Result<Option<TopggConfig>, ConfigError> {
+        let interval_secs: u64 = self.optional("TOPGG_INTERVAL_SECS")?.unwrap_or(900);
+        if interval_secs < 60 {
+            return Err(ConfigError::Invalid {
+                name: "TOPGG_INTERVAL_SECS",
+                value: interval_secs.to_string(),
+                reason: "need at least 60 seconds".into(),
+            });
+        }
+        let Some(token) = self.string("TOPGG_TOKEN") else {
+            return Ok(None);
+        };
+        let invalid = |reason: &str| ConfigError::Invalid {
+            name: "TOPGG_TOKEN",
+            value: "***".to_owned(),
+            reason: reason.to_owned(),
+        };
+        let token = token.trim();
+        if !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(invalid("expected visible ASCII characters only"));
+        }
+        if !state.enabled {
+            return Err(invalid("needs STATE_ENABLED to count the guilds"));
+        }
+        Ok(Some(TopggConfig {
+            token: token.to_owned(),
+            interval: Duration::from_secs(interval_secs),
+        }))
     }
 
     /// `AMQP_URL`, or a URL built from the `RABBIT_*` variables with their
@@ -1012,6 +1072,35 @@ pub(crate) mod tests {
         assert_eq!((config.workers, config.large_threshold), (1024, 50));
     }
 
+    #[test]
+    fn topgg_posting_needs_a_token_and_the_state_cache() {
+        assert_eq!(load(&example_env()).unwrap().topgg, None);
+        let config = with(&[("TOPGG_TOKEN", " project-token ")]).unwrap();
+        let topgg = config.topgg.unwrap();
+        assert_eq!(topgg.token, "project-token");
+        assert_eq!(topgg.interval, Duration::from_secs(900));
+        // Debug leaves the token out.
+        assert_eq!(format!("{topgg:?}"), "TopggConfig { interval: 900s, .. }");
+
+        let changes = [("TOPGG_TOKEN", "t"), ("TOPGG_INTERVAL_SECS", "60")];
+        let topgg = with(&changes).unwrap().topgg.unwrap();
+        assert_eq!(topgg.interval, Duration::from_secs(60));
+        // Checked without a token too, as every other value.
+        assert_invalid("TOPGG_INTERVAL_SECS", &[("TOPGG_INTERVAL_SECS", "59")]);
+
+        for changes in [
+            &[("TOPGG_TOKEN", "two words")][..],
+            &[("TOPGG_TOKEN", "t"), ("STATE_ENABLED", "false")],
+        ] {
+            match with(changes) {
+                Err(ConfigError::Invalid { name, value, .. }) => {
+                    assert_eq!((name, value.as_str()), ("TOPGG_TOKEN", "***"));
+                }
+                other => panic!("{changes:?} -> {other:?}"),
+            }
+        }
+    }
+
     /// The metrics server binds PROMETHEUS_HOST, so it is resolved here; the
     /// loopback names that /etc/hosts usually has are accepted too.
     #[test]
@@ -1211,6 +1300,7 @@ pub(crate) mod tests {
                 ("LOG_GUILD_CHANNEL", "2"),
                 ("DISCORD_API_PROXY", "http://proxy:3000"),
                 ("DISCORD_GATEWAY_URL", "ws://gateway:8080"),
+                ("TOPGG_TOKEN", "token"),
             ],
             &[
                 ("SHARDS_START", ""),

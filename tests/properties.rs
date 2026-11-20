@@ -2057,6 +2057,8 @@ const VARIABLES: &[&str] = &[
     "DISCORD_GATEWAY_URL",
     "REQUEST_MEMBERS",
     "MEMBER_REFRESH_HOURS",
+    "TOPGG_TOKEN",
+    "TOPGG_INTERVAL_SECS",
 ];
 
 /// Variables whose absence is reported as `Missing`.
@@ -2149,6 +2151,11 @@ fn check_loaded(config: &Config) -> Result<(), TestCaseError> {
         prop_assert!(!proxy.address.is_empty() && !proxy.address.contains('/'));
     }
     prop_assert!(!config.bot_token.trim().is_empty());
+    if let Some(topgg) = &config.topgg {
+        prop_assert!(state.enabled && topgg.interval >= Duration::from_secs(60));
+        prop_assert!(topgg.token.bytes().all(|b| b.is_ascii_graphic()));
+        prop_assert!(!topgg.token.is_empty());
+    }
     Ok(())
 }
 
