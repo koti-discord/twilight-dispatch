@@ -104,6 +104,7 @@ fn context<C, P>(
         breaker: Breaker::default(),
         cache_errors: Throttle::default(),
         publish_errors: Throttle::default(),
+        publish_events: None,
     }
 }
 
@@ -308,6 +309,72 @@ async fn a_recent_join_known_only_from_an_unavailable_stub_is_logged() {
     let joined = job(&handle, "GUILD_CREATE", 5, recent_guild(4000, "m"));
     worker::process(&ctx, &mut conn, joined).await;
     assert_eq!(joins() - before, 2, "after an unavailable GUILD_CREATE");
+}
+
+/// With `PUBLISH_EVENTS` set only the listed events are published. An event
+/// that is not listed is still applied to the cache and still completes its
+/// sequence token, so the resume point passes it.
+#[tokio::test]
+async fn only_listed_events_are_published_but_every_event_is_cached_and_completed() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(4).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let mut ctx = context(
+        conn.clone(),
+        recorder.clone(),
+        registry(&handle),
+        state_all(),
+        DiscordLog::disabled(),
+    );
+    ctx.publish_events = Some(["GUILD_DELETE".to_owned()].into());
+
+    let create = job(&handle, "GUILD_CREATE", 2, guild(1000, "g"));
+    worker::process(&ctx, &mut conn, create).await;
+    assert_eq!(get(&mut conn, "guild:1000").await.unwrap()["name"], "g");
+    assert_eq!(recorder.published(), [], "GUILD_CREATE is not listed");
+    assert_eq!(handle.in_flight(), 0, "but its sequence completed");
+
+    let delete = job(&handle, "GUILD_DELETE", 3, json!({"id": "1000"}));
+    worker::process(&ctx, &mut conn, delete).await;
+    assert!(get(&mut conn, "guild:1000").await.is_none());
+    assert_eq!(
+        recorder.published(),
+        [("GUILD_DELETE".to_owned(), Some("0:s1:3".to_owned()))]
+    );
+    assert_eq!(handle.in_flight(), 0);
+}
+
+/// The allow-list needs only the event name: a job without a typed event
+/// (the cache is off) is filtered by it too.
+#[tokio::test]
+async fn the_allow_list_applies_without_the_cache() {
+    let recorder = Arc::new(Recorder::default());
+    let mut ctx = context(
+        NoRedis,
+        recorder.clone(),
+        Arc::new(Registry::default()),
+        StateConfig::default(),
+        DiscordLog::disabled(),
+    );
+    ctx.publish_events = Some(["B".to_owned()].into());
+    for (seq, kind) in [(2, "A"), (3, "B")] {
+        let queued = Job {
+            shard: 0,
+            seq: Some(seq),
+            token: None,
+            session: None,
+            json: format!(r#"{{"op":0,"t":"{kind}","s":{seq},"d":{{}}}}"#),
+            event: None,
+        };
+        worker::process(&ctx, &mut NoRedis, queued).await;
+    }
+    assert_eq!(
+        recorder.published(),
+        [("B".to_owned(), Some("0::3".to_owned()))]
+    );
 }
 
 /// `spawn` starts at least one worker even for a count of 0 (the runner

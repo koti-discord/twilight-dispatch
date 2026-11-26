@@ -8,8 +8,9 @@
 //! became optional or were added (see `.env.example`).
 
 use serde::de::DeserializeOwned;
-use std::{fmt, time::Duration};
+use std::{collections::HashSet, fmt, time::Duration};
 use twilight_model::gateway::{
+    event::EventType,
     presence::{ActivityType, Status},
     Intents,
 };
@@ -40,6 +41,11 @@ pub struct Config {
     /// as published only once the broker confirmed it. Off by default, because
     /// with confirms each worker waits for one broker disk sync per event.
     pub amqp_confirms: bool,
+    /// The dispatch events to publish (`PUBLISH_EVENTS`, a comma-separated list
+    /// of event names such as `MESSAGE_CREATE`). `None` (unset, the default)
+    /// publishes every event. Events not listed are still cached and their
+    /// sequence still completes; they are only not published.
+    pub publish_events: Option<HashSet<String>>,
     /// Whether shards resume the sessions saved in Redis by the previous run
     /// (`RESUME`, default `true`). Only when `SHARDS_TOTAL` is set and the
     /// same as in that run.
@@ -418,6 +424,7 @@ impl Config {
             });
         }
         let prometheus_host = env.prometheus_host()?;
+        let publish_events = env.publish_events()?;
 
         Ok(Self {
             bot_token: env.required_string("BOT_TOKEN")?,
@@ -425,6 +432,7 @@ impl Config {
             shards_concurrency: env.optional("SHARDS_CONCURRENCY")?,
             default_queue: env.optional("DEFAULT_QUEUE")?.unwrap_or(true),
             amqp_confirms: env.optional("AMQP_CONFIRMS")?.unwrap_or(false),
+            publish_events,
             resume: env.optional("RESUME")?.unwrap_or(true),
             intents,
             large_threshold,
@@ -545,6 +553,36 @@ impl Env<'_> {
     /// blank.
     fn required<T: DeserializeOwned>(&self, name: &'static str) -> Result<T, ConfigError> {
         self.optional(name)?.ok_or(ConfigError::Missing(name))
+    }
+
+    /// `PUBLISH_EVENTS`: the names of the dispatch events to publish, or `None`
+    /// when it is unset or blank. Every entry must be the name of a dispatch
+    /// event twilight knows, so an empty entry (a stray comma) and a misspelt
+    /// name are errors, not events that silently never match.
+    fn publish_events(&self) -> Result<Option<HashSet<String>>, ConfigError> {
+        let Some(value) = self.string("PUBLISH_EVENTS") else {
+            return Ok(None);
+        };
+        let mut names = HashSet::new();
+        for name in value.split(',').map(str::trim) {
+            if name.is_empty() {
+                return Err(ConfigError::Invalid {
+                    name: "PUBLISH_EVENTS",
+                    value,
+                    reason: "empty event name (a stray comma?)".into(),
+                });
+            }
+            if !is_dispatch_event(name) {
+                return Err(ConfigError::Invalid {
+                    name: "PUBLISH_EVENTS",
+                    value: name.to_owned(),
+                    reason: "not the name of a Discord dispatch event, such as MESSAGE_CREATE"
+                        .into(),
+                });
+            }
+            names.insert(name.to_owned());
+        }
+        Ok(Some(names))
     }
 
     /// `SHARDS_START`, `SHARDS_END` and `SHARDS_TOTAL`: `None` when all three
@@ -734,6 +772,11 @@ impl Env<'_> {
             }),
         }
     }
+}
+
+/// Whether `name` is a dispatch event twilight knows (`MESSAGE_CREATE`).
+fn is_dispatch_event(name: &str) -> bool {
+    EventType::try_from(name).is_ok()
 }
 
 /// An IP address, or `localhost` (accepted by earlier versions' examples).
@@ -1099,6 +1142,46 @@ pub(crate) mod tests {
                 other => panic!("{changes:?} -> {other:?}"),
             }
         }
+    }
+
+    /// `PUBLISH_EVENTS` is unset (everything is published), a trimmed list of
+    /// dispatch event names, or an error that names the offending entry.
+    #[test]
+    fn publish_events_is_a_list_of_dispatch_event_names() {
+        assert_eq!(with(&[]).unwrap().publish_events, None);
+        assert_eq!(
+            with(&[("PUBLISH_EVENTS", "  ")]).unwrap().publish_events,
+            None
+        );
+
+        let listed = with(&[(
+            "PUBLISH_EVENTS",
+            "MESSAGE_CREATE, GUILD_CREATE ,MESSAGE_CREATE",
+        )])
+        .unwrap()
+        .publish_events
+        .unwrap();
+        let expected: HashSet<String> =
+            ["MESSAGE_CREATE", "GUILD_CREATE"].map(str::to_owned).into();
+        assert_eq!(listed, expected);
+
+        for value in [
+            "MESSAGE_CREAT",
+            "message_create",
+            "MESSAGE_CREATE,",
+            ",",
+            "A,,B",
+        ] {
+            assert_invalid("PUBLISH_EVENTS", &[("PUBLISH_EVENTS", value)]);
+        }
+        let error = with(&[("PUBLISH_EVENTS", "MESSAGE_CREATE,NOPE")]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid environment variable PUBLISH_EVENTS=\"NOPE\": not the name of a \
+             Discord dispatch event, such as MESSAGE_CREATE"
+        );
+        let error = with(&[("PUBLISH_EVENTS", "MESSAGE_CREATE,,GUILD_CREATE")]).unwrap_err();
+        assert!(error.to_string().contains("empty event name"), "{error}");
     }
 
     /// The metrics server binds PROMETHEUS_HOST, so it is resolved here; the

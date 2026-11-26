@@ -21,6 +21,14 @@ posts a message to a channel through Discord's REST API (see Operations).
 Configuration is read from environment variables (or `.env`); see
 [`.env.example`](.env.example).
 
+`PUBLISH_EVENTS` (optional, a comma-separated list of dispatch event names such
+as `MESSAGE_CREATE,GUILD_CREATE,GUILD_DELETE`) limits what is published: only
+the listed events go to the exchange. Every other event is still applied to the
+state cache and still completes its sequence number, so the saved resume point
+keeps advancing; it is just not sent to the broker. Unset, every event is
+published. An empty entry or a name that is not a dispatch event is a
+configuration error.
+
 ### Operations
 
 - `GET /metrics` (Prometheus) and `GET /healthcheck` on `PROMETHEUS_HOST:PROMETHEUS_PORT`.

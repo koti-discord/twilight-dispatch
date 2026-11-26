@@ -2017,6 +2017,7 @@ const VARIABLES: &[&str] = &[
     "SHARDS_TOTAL",
     "SHARDS_CONCURRENCY",
     "DEFAULT_QUEUE",
+    "PUBLISH_EVENTS",
     "RESUME",
     "INTENTS",
     "LARGE_THRESHOLD",

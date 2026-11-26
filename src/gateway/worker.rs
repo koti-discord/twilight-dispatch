@@ -20,6 +20,7 @@ use crate::{
 use redis::aio::ConnectionLike;
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     future::Future,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
@@ -219,6 +220,9 @@ pub struct WorkerContext<C, P> {
     pub cache_errors: Throttle,
     /// Rate limit for the warnings about failed publishes.
     pub publish_errors: Throttle,
+    /// The events to publish (`PUBLISH_EVENTS`); `None` publishes every event.
+    /// The others are cached and complete their sequence like a published one.
+    pub publish_events: Option<HashSet<String>>,
 }
 
 /// Start `count` workers (at least one: the runner indexes into the returned
@@ -499,7 +503,8 @@ fn log_guild_changes<C, P>(ctx: &WorkerContext<C, P>, event: &Event, outcome: Op
     }
 }
 
-/// Publish a payload. Returns false only when the publisher failed (for the
+/// Publish a payload, unless `PUBLISH_EVENTS` leaves its event out (that counts
+/// as done). Returns false only when the publisher failed (for the
 /// broker: shutting down, unreachable past the outage budget, a write timeout
 /// or error, or with `AMQP_CONFIRMS` a nack or missing confirm), so the resume
 /// point stays before it. Payloads that cannot be published at all are logged
@@ -524,6 +529,14 @@ where
     let Some(kind) = envelope.kind() else {
         return true;
     };
+    if ctx
+        .publish_events
+        .as_ref()
+        .is_some_and(|events| !events.contains(kind))
+    {
+        // Not on the allow-list: done, so the resume point passes it.
+        return true;
+    }
     let body = match payload::outgoing(&envelope, old.as_ref()) {
         Ok(body) => body,
         Err(err) => {
@@ -664,6 +677,7 @@ mod tests {
             breaker: Breaker::default(),
             cache_errors: Throttle::default(),
             publish_errors: Throttle::default(),
+            publish_events: None,
         };
         ctx.breaker.state().open_until = Some(Instant::now());
         ctx

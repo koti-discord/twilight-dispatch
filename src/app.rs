@@ -208,6 +208,7 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
         breaker: Breaker::default(),
         cache_errors: Throttle::default(),
         publish_errors: Throttle::default(),
+        publish_events: config.publish_events.clone(),
     });
     let (queues, workers) = worker::spawn(config.workers, worker_ctx);
 

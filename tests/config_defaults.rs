@@ -27,6 +27,7 @@ const OPTIONAL: &[&str] = &[
     "SHARDS_CONCURRENCY",
     "DEFAULT_QUEUE",
     "AMQP_CONFIRMS",
+    "PUBLISH_EVENTS",
     "RESUME",
     "LARGE_THRESHOLD",
     "STATUS",

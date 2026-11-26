@@ -392,6 +392,7 @@ fn context<C, P>(
         breaker: Breaker::default(),
         cache_errors: Throttle::default(),
         publish_errors: Throttle::default(),
+        publish_events: None,
     }
 }
 
