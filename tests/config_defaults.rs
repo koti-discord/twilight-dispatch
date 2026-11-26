@@ -28,6 +28,8 @@ const OPTIONAL: &[&str] = &[
     "DEFAULT_QUEUE",
     "AMQP_CONFIRMS",
     "PUBLISH_EVENTS",
+    "CHAT_FILTER",
+    "CHAT_FILTER_WINDOW_SECS",
     "RESUME",
     "LARGE_THRESHOLD",
     "STATUS",
@@ -103,6 +105,7 @@ fn unset_variables_take_their_documented_defaults() {
     assert_eq!(config.shards_concurrency, None);
     assert!(config.default_queue);
     assert!(!config.amqp_confirms);
+    assert_eq!(config.chat_filter, None);
     assert!(config.resume);
     assert_eq!(config.intents.bits(), 513);
     assert_eq!(config.large_threshold, 250);

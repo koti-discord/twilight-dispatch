@@ -46,6 +46,12 @@ pub struct Config {
     /// publishes every event. Events not listed are still cached and their
     /// sequence still completes; they are only not published.
     pub publish_events: Option<HashSet<String>>,
+    /// The chat source filter: `None` unless `CHAT_FILTER=true`, then the
+    /// window (`CHAT_FILTER_WINDOW_SECS`, default 0: no per-pair window).
+    /// `MESSAGE_CREATE` events from bots, webhooks and DMs, system messages,
+    /// and repeats of a (guild, user) pair inside the window are then not
+    /// published. They are still cached and their sequence still completes.
+    pub chat_filter: Option<Duration>,
     /// Whether shards resume the sessions saved in Redis by the previous run
     /// (`RESUME`, default `true`). Only when `SHARDS_TOTAL` is set and the
     /// same as in that run.
@@ -425,6 +431,7 @@ impl Config {
         }
         let prometheus_host = env.prometheus_host()?;
         let publish_events = env.publish_events()?;
+        let chat_filter = env.chat_filter()?;
 
         Ok(Self {
             bot_token: env.required_string("BOT_TOKEN")?,
@@ -433,6 +440,7 @@ impl Config {
             default_queue: env.optional("DEFAULT_QUEUE")?.unwrap_or(true),
             amqp_confirms: env.optional("AMQP_CONFIRMS")?.unwrap_or(false),
             publish_events,
+            chat_filter,
             resume: env.optional("RESUME")?.unwrap_or(true),
             intents,
             large_threshold,
@@ -583,6 +591,14 @@ impl Env<'_> {
             names.insert(name.to_owned());
         }
         Ok(Some(names))
+    }
+
+    /// `CHAT_FILTER` and `CHAT_FILTER_WINDOW_SECS`: the window when the filter
+    /// is on. The window is checked, as every other value, with the filter off.
+    fn chat_filter(&self) -> Result<Option<Duration>, ConfigError> {
+        let on = self.optional("CHAT_FILTER")?.unwrap_or(false);
+        let secs: u64 = self.optional("CHAT_FILTER_WINDOW_SECS")?.unwrap_or(0);
+        Ok(on.then(|| Duration::from_secs(secs)))
     }
 
     /// `SHARDS_START`, `SHARDS_END` and `SHARDS_TOTAL`: `None` when all three
@@ -1182,6 +1198,32 @@ pub(crate) mod tests {
         );
         let error = with(&[("PUBLISH_EVENTS", "MESSAGE_CREATE,,GUILD_CREATE")]).unwrap_err();
         assert!(error.to_string().contains("empty event name"), "{error}");
+    }
+
+    /// The chat filter is off, without a window, unless set.
+    #[test]
+    fn chat_filter_is_off_by_default_and_takes_a_window_in_seconds() {
+        let config = with(&[]).unwrap();
+        assert_eq!(config.chat_filter, None);
+
+        let config = with(&[("CHAT_FILTER", "true"), ("CHAT_FILTER_WINDOW_SECS", "30")]).unwrap();
+        assert_eq!(config.chat_filter, Some(Duration::from_secs(30)));
+
+        let config = with(&[("CHAT_FILTER", "true")]).unwrap();
+        assert_eq!(config.chat_filter, Some(Duration::ZERO));
+
+        let config = with(&[("CHAT_FILTER_WINDOW_SECS", "30")]).unwrap();
+        assert_eq!(config.chat_filter, None, "the window alone does nothing");
+
+        assert_invalid("CHAT_FILTER", &[("CHAT_FILTER", "maybe")]);
+        assert_invalid(
+            "CHAT_FILTER_WINDOW_SECS",
+            &[("CHAT_FILTER_WINDOW_SECS", "-1")],
+        );
+        assert_invalid(
+            "CHAT_FILTER_WINDOW_SECS",
+            &[("CHAT_FILTER_WINDOW_SECS", "soon")],
+        );
     }
 
     /// The metrics server binds PROMETHEUS_HOST, so it is resolved here; the

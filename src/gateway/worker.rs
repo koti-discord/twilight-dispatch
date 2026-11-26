@@ -7,12 +7,17 @@
 //! failed update is not applied, and one that timed out may still be applied
 //! after the event was published). Different guilds are processed in parallel.
 
-use super::{payload, registry::Registry, seq::SeqToken};
+use super::{
+    chat_filter::{ChatFilter, Verdict},
+    payload,
+    registry::Registry,
+    seq::SeqToken,
+};
 use crate::{
     cache::{self, Outcome, UpdateContext},
     config::StateConfig,
     discord_log::DiscordLog,
-    metrics::{GUILD_EVENTS, STATE_UPDATE_ERRORS},
+    metrics::{CHAT_FILTERED, GUILD_EVENTS, STATE_UPDATE_ERRORS},
     models::{ApiError, ApiResult, FormattedDateTime},
     util::Throttle,
 };
@@ -223,6 +228,10 @@ pub struct WorkerContext<C, P> {
     /// The events to publish (`PUBLISH_EVENTS`); `None` publishes every event.
     /// The others are cached and complete their sequence like a published one.
     pub publish_events: Option<HashSet<String>>,
+    /// The chat source filter (`CHAT_FILTER`), shared by every worker; `None`
+    /// when it is off. A message it drops is cached and completes its
+    /// sequence like one left out by `publish_events`.
+    pub chat_filter: Option<ChatFilter>,
 }
 
 /// Start `count` workers (at least one: the runner indexes into the returned
@@ -537,6 +546,18 @@ where
         // Not on the allow-list: done, so the resume point passes it.
         return true;
     }
+    if let (Some(filter), "MESSAGE_CREATE", Some(data)) = (&ctx.chat_filter, kind, envelope.d) {
+        match filter.check(data.get()) {
+            Verdict::Drop(reason) => {
+                CHAT_FILTERED.with_label_values(&[reason.label()]).inc();
+                return true;
+            }
+            // `dropped` is how many messages of the pair the window dropped
+            // since its previous published one; the compact payload takes it
+            // from here.
+            Verdict::Publish { .. } => {}
+        }
+    }
     let body = match payload::outgoing(&envelope, old.as_ref()) {
         Ok(body) => body,
         Err(err) => {
@@ -678,6 +699,7 @@ mod tests {
             cache_errors: Throttle::default(),
             publish_errors: Throttle::default(),
             publish_events: None,
+            chat_filter: None,
         };
         ctx.breaker.state().open_until = Some(Instant::now());
         ctx

@@ -8,6 +8,7 @@ use crate::{
     discord_log::DiscordLog,
     gateway::{
         self,
+        chat_filter::ChatFilter,
         queue::RedisQueue,
         registry::{Registry, ShardHandle},
         runner::{self, RunnerContext},
@@ -209,6 +210,7 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
         cache_errors: Throttle::default(),
         publish_errors: Throttle::default(),
         publish_events: config.publish_events.clone(),
+        chat_filter: config.chat_filter.map(ChatFilter::new),
     });
     let (queues, workers) = worker::spawn(config.workers, worker_ctx);
 

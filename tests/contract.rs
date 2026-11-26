@@ -1081,6 +1081,7 @@ async fn published_messages() {
         cache_errors: Throttle::default(),
         publish_errors: Throttle::default(),
         publish_events: None,
+        chat_filter: None,
     };
 
     let mut edited = message(2001, G + 3, Some(G), "edited");

@@ -20,11 +20,12 @@ use twilight_dispatch::{
     config::StateConfig,
     discord_log::DiscordLog,
     gateway::{
+        chat_filter::ChatFilter,
         registry::{Registry, ShardHandle},
         runner::parse_event,
         worker::{self, Breaker, Job, Publisher, WorkerContext},
     },
-    metrics::GUILD_EVENTS,
+    metrics::{CHAT_FILTERED, GUILD_EVENTS},
     models::ApiResult,
     util::Throttle,
 };
@@ -105,6 +106,7 @@ fn context<C, P>(
         cache_errors: Throttle::default(),
         publish_errors: Throttle::default(),
         publish_events: None,
+        chat_filter: None,
     }
 }
 
@@ -375,6 +377,117 @@ async fn the_allow_list_applies_without_the_cache() {
         recorder.published(),
         [("B".to_owned(), Some("0::3".to_owned()))]
     );
+}
+
+/// A `MESSAGE_CREATE` of shard 0 in channel 3 of guild 1000 by user 1.
+fn chat_job(handle: &ShardHandle, seq: u64, edit: impl FnOnce(&mut Value)) -> Job {
+    let mut d = message(seq, 3, Some(1000), "hi");
+    edit(&mut d);
+    job(handle, "MESSAGE_CREATE", seq, d)
+}
+
+fn filtered(reason: &str) -> u64 {
+    CHAT_FILTERED.with_label_values(&[reason]).get()
+}
+
+/// With the chat filter on, a message it drops is not published, but it is
+/// still cached and its sequence token completes, like an event left out by
+/// `PUBLISH_EVENTS`. A second message of the same user inside the window is
+/// one of them.
+#[tokio::test]
+async fn filtered_messages_are_cached_and_complete_their_sequence() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(5).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let mut ctx = context(
+        conn.clone(),
+        recorder.clone(),
+        registry(&handle),
+        state_all(),
+        DiscordLog::disabled(),
+    );
+    ctx.chat_filter = Some(ChatFilter::new(Duration::from_secs(3600)));
+    let (bots, repeats) = (filtered("bot"), filtered("window"));
+
+    worker::process(&ctx, &mut conn, chat_job(&handle, 2, |_| {})).await;
+    worker::process(&ctx, &mut conn, chat_job(&handle, 3, |_| {})).await;
+    let bot = chat_job(&handle, 4, |d| d["author"]["bot"] = json!(true));
+    worker::process(&ctx, &mut conn, bot).await;
+
+    assert_eq!(
+        recorder.published(),
+        [("MESSAGE_CREATE".to_owned(), Some("0:s1:2".to_owned()))]
+    );
+    for id in [2, 3, 4] {
+        let key = format!("message:3:{id}");
+        assert!(get(&mut conn, &key).await.is_some(), "{key} is cached");
+    }
+    assert_eq!(handle.in_flight(), 0, "every sequence completed");
+    assert_eq!(filtered("window") - repeats, 1);
+    assert_eq!(filtered("bot") - bots, 1);
+}
+
+/// Only `MESSAGE_CREATE` is looked at, and only after `PUBLISH_EVENTS`: an
+/// event the allow-list leaves out never reaches the filter, so it does not
+/// start a window; other events pass through.
+#[tokio::test]
+async fn the_chat_filter_follows_the_allow_list_and_only_reads_messages() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(6).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let mut ctx = context(
+        conn.clone(),
+        recorder.clone(),
+        registry(&handle),
+        state_all(),
+        DiscordLog::disabled(),
+    );
+    ctx.chat_filter = Some(ChatFilter::new(Duration::from_secs(3600)));
+    ctx.publish_events = Some(["GUILD_CREATE".to_owned()].into());
+
+    worker::process(&ctx, &mut conn, chat_job(&handle, 2, |_| {})).await;
+    assert!(recorder.published().is_empty());
+    assert_eq!(ctx.chat_filter.as_ref().unwrap().pairs(), 0);
+
+    let create = job(&handle, "GUILD_CREATE", 3, guild(1000, "g"));
+    worker::process(&ctx, &mut conn, create).await;
+    assert_eq!(
+        recorder.published().len(),
+        1,
+        "other events are not filtered"
+    );
+    assert_eq!(handle.in_flight(), 0);
+}
+
+/// Without `CHAT_FILTER` every message is published, bots and repeats too.
+#[tokio::test]
+async fn without_the_chat_filter_every_message_is_published() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(7).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let ctx = context(
+        conn.clone(),
+        recorder.clone(),
+        registry(&handle),
+        state_all(),
+        DiscordLog::disabled(),
+    );
+    worker::process(&ctx, &mut conn, chat_job(&handle, 2, |_| {})).await;
+    worker::process(&ctx, &mut conn, chat_job(&handle, 3, |_| {})).await;
+    let bot = chat_job(&handle, 4, |d| d["author"]["bot"] = json!(true));
+    worker::process(&ctx, &mut conn, bot).await;
+    let dm = job(&handle, "MESSAGE_CREATE", 5, message(5, 3, None, "dm"));
+    worker::process(&ctx, &mut conn, dm).await;
+    assert_eq!(recorder.published().len(), 4);
 }
 
 /// `spawn` starts at least one worker even for a count of 0 (the runner

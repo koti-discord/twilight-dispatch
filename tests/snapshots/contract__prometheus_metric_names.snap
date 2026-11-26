@@ -22,6 +22,14 @@ expression: families
     "type": "COUNTER"
   },
   {
+    "help": "MESSAGE_CREATE events the chat filter did not publish (bot, webhook, dm, system, window)",
+    "labels": [
+      "reason"
+    ],
+    "name": "gateway_chat_filtered",
+    "type": "COUNTER"
+  },
+  {
     "help": "Commands from gateway.send by outcome (sent, forwarded, dropped, invalid, posted, failed)",
     "labels": [
       "shard",

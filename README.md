@@ -29,6 +29,20 @@ keeps advancing; it is just not sent to the broker. Unset, every event is
 published. An empty entry or a name that is not a dispatch event is a
 configuration error.
 
+`CHAT_FILTER=true` (off by default) leaves out of the published events the
+`MESSAGE_CREATE` events that are not chat: those from bots (`author.bot`), from
+webhooks (`webhook_id`), DMs (no `guild_id`) and system messages (any message
+type except 0, default, and 19, reply). With `CHAT_FILTER_WINDOW_SECS` above 0
+(default 0, no window) a message is also left out when a message of the same
+(guild, user) pair was published less than that many seconds before; the window
+starts at each published message. The filter remembers at most 100000 pairs in
+memory, forgetting those whose window is over first; with more live pairs than
+that, a new pair is published without being remembered. Like an event left out
+by `PUBLISH_EVENTS` (which is checked first), a filtered message is still
+applied to the state cache and still completes its sequence number. They are
+counted in `gateway_chat_filtered{reason}` (`bot`, `webhook`, `dm`, `system`,
+`window`).
+
 ### Operations
 
 - `GET /metrics` (Prometheus) and `GET /healthcheck` on `PROMETHEUS_HOST:PROMETHEUS_PORT`.
