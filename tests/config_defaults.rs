@@ -30,6 +30,7 @@ const OPTIONAL: &[&str] = &[
     "PUBLISH_EVENTS",
     "CHAT_FILTER",
     "CHAT_FILTER_WINDOW_SECS",
+    "COMPACT_MESSAGE_CREATE",
     "RESUME",
     "LARGE_THRESHOLD",
     "STATUS",

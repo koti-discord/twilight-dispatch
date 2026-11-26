@@ -210,7 +210,10 @@ async fn start(config: Config, listener: TcpListener) -> ApiResult<Started> {
         cache_errors: Throttle::default(),
         publish_errors: Throttle::default(),
         publish_events: config.publish_events.clone(),
-        chat_filter: config.chat_filter.map(ChatFilter::new),
+        chat_filter: config
+            .chat_filter
+            .map(|filter| ChatFilter::new(filter.window)),
+        compact_message_create: config.chat_filter.is_some_and(|filter| filter.compact),
     });
     let (queues, workers) = worker::spawn(config.workers, worker_ctx);
 

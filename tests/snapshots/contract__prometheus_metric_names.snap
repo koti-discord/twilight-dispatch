@@ -39,6 +39,12 @@ expression: families
     "type": "COUNTER"
   },
   {
+    "help": "MESSAGE_CREATE events not published because they do not fit the compact payload",
+    "labels": [],
+    "name": "gateway_compact_unreadable",
+    "type": "COUNTER"
+  },
+  {
     "help": "Events received through the Discord gateway",
     "labels": [
       "type",

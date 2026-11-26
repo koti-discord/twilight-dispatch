@@ -169,6 +169,7 @@ fn start(
         publish_errors: Throttle::default(),
         publish_events: None,
         chat_filter: None,
+        compact_message_create: false,
     });
     let (workers, _) = worker::spawn(1, worker_ctx);
     let runner_ctx = Arc::new(RunnerContext {

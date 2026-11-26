@@ -13,7 +13,10 @@ use fake_discord::FakeDiscord;
 use redis::aio::ConnectionLike;
 use serde_json::{json, Value};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use twilight_dispatch::{
@@ -25,7 +28,7 @@ use twilight_dispatch::{
         runner::parse_event,
         worker::{self, Breaker, Job, Publisher, WorkerContext},
     },
-    metrics::{CHAT_FILTERED, GUILD_EVENTS},
+    metrics::{CHAT_FILTERED, COMPACT_UNREADABLE, GUILD_EVENTS},
     models::ApiResult,
     util::Throttle,
 };
@@ -38,13 +41,22 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// The `LOG_GUILD_CHANNEL` on the fake Discord.
 const GUILD_LOG: u64 = 22;
 
-/// The routing key and message id of every published event.
+/// The routing key and message id of every published event, and its body.
+/// The next `fail` publishes fail instead.
 #[derive(Default)]
-struct Recorder(Mutex<Vec<(String, Option<String>)>>);
+struct Recorder {
+    published: Mutex<Vec<(String, Option<String>)>>,
+    bodies: Mutex<Vec<String>>,
+    fail: AtomicUsize,
+}
 
 impl Recorder {
     fn published(&self) -> Vec<(String, Option<String>)> {
-        self.0.lock().unwrap().clone()
+        self.published.lock().unwrap().clone()
+    }
+
+    fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().unwrap().clone()
     }
 }
 
@@ -52,10 +64,22 @@ impl Publisher for Recorder {
     async fn publish(
         &self,
         routing_key: &str,
-        _payload: Vec<u8>,
+        payload: Vec<u8>,
         message_id: Option<String>,
     ) -> ApiResult<()> {
-        let mut published = self.0.lock().unwrap();
+        let failing = self
+            .fail
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            });
+        if failing.is_ok() {
+            return Err("the broker is down".to_owned().into());
+        }
+        self.bodies
+            .lock()
+            .unwrap()
+            .push(String::from_utf8(payload).unwrap());
+        let mut published = self.published.lock().unwrap();
         published.push((routing_key.to_owned(), message_id));
         Ok(())
     }
@@ -107,6 +131,7 @@ fn context<C, P>(
         publish_errors: Throttle::default(),
         publish_events: None,
         chat_filter: None,
+        compact_message_create: false,
     }
 }
 
@@ -488,6 +513,241 @@ async fn without_the_chat_filter_every_message_is_published() {
     let dm = job(&handle, "MESSAGE_CREATE", 5, message(5, 3, None, "dm"));
     worker::process(&ctx, &mut conn, dm).await;
     assert_eq!(recorder.published().len(), 4);
+}
+
+/// A `MESSAGE_CREATE` by user `user` in `channel` of guild 1000, with the
+/// message id `seq`.
+fn message_job(handle: &ShardHandle, seq: u64, channel: u64, user: u64) -> Job {
+    let mut d = message(seq, channel, Some(1000), "hi");
+    d["author"] = common::user(user, "author");
+    job(handle, "MESSAGE_CREATE", seq, d)
+}
+
+/// A context with the chat filter (window `window`) and the compact payload on.
+fn compact_context<C, P>(
+    redis: C,
+    publisher: Arc<P>,
+    handle: &Arc<ShardHandle>,
+    state: StateConfig,
+    window: Duration,
+) -> WorkerContext<C, P> {
+    let mut ctx = context(
+        redis,
+        publisher,
+        registry(handle),
+        state,
+        DiscordLog::disabled(),
+    );
+    ctx.chat_filter = Some(ChatFilter::new(window));
+    ctx.compact_message_create = true;
+    ctx
+}
+
+/// The `d` of a published body.
+fn data_of(body: &str) -> Value {
+    serde_json::from_str::<Value>(body).unwrap()["d"].clone()
+}
+
+/// With the compact payload on, a published `MESSAGE_CREATE` is the same
+/// envelope (routing key and message id too) around a `d` of seven fields,
+/// in this order. The parent is the cached thread's parent, `null` for a
+/// channel that is not a cached thread.
+#[tokio::test]
+async fn a_compact_message_create_has_seven_fields_and_the_threads_parent() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(8).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let ctx = compact_context(
+        conn.clone(),
+        recorder.clone(),
+        &handle,
+        state_all(),
+        Duration::ZERO,
+    );
+
+    // Guild 1000 has the thread 1005 (parent 1003) and the channel 1003.
+    let create = job(&handle, "GUILD_CREATE", 2, guild(1000, "g"));
+    worker::process(&ctx, &mut conn, create).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 3, 1005, 7)).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 4, 1003, 8)).await;
+
+    let published = recorder.published();
+    assert_eq!(published[0].0, "GUILD_CREATE");
+    assert_eq!(
+        published[1..],
+        [
+            ("MESSAGE_CREATE".to_owned(), Some("0:s1:3".to_owned())),
+            ("MESSAGE_CREATE".to_owned(), Some("0:s1:4".to_owned())),
+        ]
+    );
+    let bodies = recorder.bodies();
+    assert!(
+        bodies[0].contains(r#""name":"g""#),
+        "other events are whole"
+    );
+    insta::assert_snapshot!("compact_message_create_in_a_thread", bodies[1]);
+    insta::assert_snapshot!("compact_message_create_in_a_channel", bodies[2]);
+    assert_eq!(handle.in_flight(), 0);
+}
+
+/// `dropped` is how many messages of the (guild, user) pair the window dropped
+/// since the previous published one, and starts over after it.
+#[tokio::test]
+async fn the_compact_body_carries_the_dropped_count() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(9).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let ctx = compact_context(
+        conn.clone(),
+        recorder.clone(),
+        &handle,
+        state_all(),
+        Duration::from_secs(1),
+    );
+
+    for seq in 2..=4 {
+        worker::process(&ctx, &mut conn, message_job(&handle, seq, 3, 1)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 5, 3, 1)).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 6, 3, 1)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 7, 3, 1)).await;
+
+    let dropped: Vec<_> = recorder
+        .bodies()
+        .iter()
+        .map(|body| data_of(body)["dropped"].clone())
+        .collect();
+    assert_eq!(dropped, [json!(0), json!(2), json!(1)]);
+    assert_eq!(handle.in_flight(), 0);
+}
+
+/// A message whose publish failed comes again (the resume point stayed before
+/// it): it is published then, with the `dropped` of the first attempt, not
+/// dropped as a repeat of itself. The same holds for the first message of a
+/// pair.
+#[tokio::test]
+async fn a_failed_publish_does_not_start_the_window() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(10).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let ctx = compact_context(
+        conn.clone(),
+        recorder.clone(),
+        &handle,
+        state_all(),
+        Duration::from_secs(1),
+    );
+
+    worker::process(&ctx, &mut conn, message_job(&handle, 2, 3, 1)).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 3, 3, 1)).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 4, 3, 1)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // The next two publishes fail: user 1's third message (which would carry
+    // the 2 dropped) and user 2's first.
+    recorder.fail.store(2, Ordering::SeqCst);
+    worker::process(&ctx, &mut conn, message_job(&handle, 5, 3, 1)).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 6, 3, 2)).await;
+    assert_eq!(recorder.published().len(), 1, "nothing was published");
+
+    worker::process(&ctx, &mut conn, message_job(&handle, 5, 3, 1)).await;
+    worker::process(&ctx, &mut conn, message_job(&handle, 6, 3, 2)).await;
+    let dropped: Vec<_> = recorder
+        .bodies()
+        .iter()
+        .map(|body| data_of(body)["dropped"].clone())
+        .collect();
+    assert_eq!(dropped, [json!(0), json!(2), json!(0)]);
+}
+
+/// With `COMPACT_MESSAGE_CREATE` off the body is the envelope around Discord's
+/// own `d`, byte for byte, with the filter on.
+#[tokio::test]
+async fn without_the_compact_switch_the_body_is_untouched() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(11).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let mut ctx = compact_context(
+        conn.clone(),
+        recorder.clone(),
+        &handle,
+        state_all(),
+        Duration::ZERO,
+    );
+    ctx.compact_message_create = false;
+
+    worker::process(&ctx, &mut conn, message_job(&handle, 2, 3, 1)).await;
+    let mut d = message(2, 3, Some(1000), "hi");
+    d["author"] = common::user(1, "author");
+    assert_eq!(
+        recorder.bodies(),
+        [format!(r#"{{"op":0,"t":"MESSAGE_CREATE","d":{d}}}"#)]
+    );
+}
+
+/// With the compact payload on, a `MESSAGE_CREATE` that does not fit it is not
+/// published (consumers expect one shape). It still completes its sequence,
+/// is counted, and does not start a window for its pair.
+#[tokio::test]
+async fn an_unreadable_message_is_not_published_and_completes_its_sequence() {
+    let _serial = SERIAL.lock().await;
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let ctx = compact_context(
+        NoRedis,
+        recorder.clone(),
+        &handle,
+        StateConfig::default(),
+        Duration::from_secs(3600),
+    );
+    let before = COMPACT_UNREADABLE.get();
+
+    let mut d = message(2, 3, Some(1000), "hi");
+    d["author"] = common::user(1, "author");
+    d.as_object_mut().unwrap().remove("timestamp");
+    let unreadable = Job {
+        shard: 0,
+        seq: Some(2),
+        token: handle.dispatch(2),
+        session: Some(Arc::from("s1")),
+        json: raw("MESSAGE_CREATE", 2, d),
+        event: None,
+    };
+    worker::process(&ctx, &mut NoRedis, unreadable).await;
+    assert!(recorder.published().is_empty());
+    assert_eq!(handle.in_flight(), 0, "its sequence completed");
+    assert_eq!(COMPACT_UNREADABLE.get() - before, 1);
+
+    // Nothing was recorded for the pair; with the cache off the parent is null.
+    let mut d = message(3, 1005, Some(1000), "hi");
+    d["author"] = common::user(1, "author");
+    let readable = Job {
+        shard: 0,
+        seq: Some(3),
+        token: handle.dispatch(3),
+        session: Some(Arc::from("s1")),
+        json: raw("MESSAGE_CREATE", 3, d),
+        event: None,
+    };
+    worker::process(&ctx, &mut NoRedis, readable).await;
+    let bodies = recorder.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(data_of(&bodies[0])["parent_id"], Value::Null);
+    assert_eq!(data_of(&bodies[0])["dropped"], 0);
 }
 
 /// `spawn` starts at least one worker even for a count of 0 (the runner

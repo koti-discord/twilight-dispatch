@@ -28,7 +28,12 @@ pub const CHAT_TYPES: [u8; 2] = [0, 19];
 
 /// The most (guild, user) pairs the window remembers. With more live pairs
 /// than this, a new pair is published without being remembered.
-pub const MAX_PAIRS: usize = 100_000;
+///
+/// A pair costs about 100 bytes (key, two instants, a count, and the hash
+/// table's overhead), so a full map is roughly 100 to 150 MB, the most while
+/// the table is growing. It is sized for several hundred thousand live pairs
+/// inside one window (about 5000 chat messages a second over 100000 guilds).
+pub const MAX_PAIRS: usize = 1_000_000;
 
 /// The shortest time between two sweeps of the expired pairs of a full map,
 /// so a flood of new pairs does not walk the whole map for every message.
@@ -101,6 +106,10 @@ struct Author {
 struct Pair {
     last: Instant,
     dropped: u32,
+    /// `last` and `dropped` as they were before the latest published message
+    /// took them over, for [`ChatFilter::undo`]. `None` when that message
+    /// created the pair.
+    before: Option<(Instant, u32)>,
 }
 
 #[derive(Debug, Default)]
@@ -170,10 +179,10 @@ impl ChatFilter {
                 entry.dropped = entry.dropped.saturating_add(1);
                 return Verdict::Drop(Reason::Window);
             }
+            let dropped = std::mem::take(&mut entry.dropped);
+            entry.before = Some((entry.last, dropped));
             entry.last = now;
-            return Verdict::Publish {
-                dropped: std::mem::take(&mut entry.dropped),
-            };
+            return Verdict::Publish { dropped };
         }
         // A new pair. A full map first forgets the pairs whose window is over
         // (they would publish anyway); if it is still full the pair is not
@@ -187,10 +196,42 @@ impl ChatFilter {
                 Pair {
                     last: now,
                     dropped: 0,
+                    before: None,
                 },
             );
         }
         Verdict::Publish { dropped: 0 }
+    }
+
+    /// Take back the record of the message with this `data` that
+    /// [`ChatFilter::check`] just published, because the broker did not take
+    /// it: the pair's last published time and drop count are what they were
+    /// before it, or the pair is forgotten when that message created it. The
+    /// message comes again (the resume point stayed before it) and must be
+    /// published again with the same `dropped`, not dropped as a repeat of
+    /// itself.
+    ///
+    /// Call it right after the failed publish, before the pair's next message
+    /// is checked: one worker processes a guild's events one at a time, so
+    /// nothing is in between.
+    pub fn undo(&self, data: &str) {
+        let Ok(message) = serde_json::from_str::<Message>(data) else {
+            return;
+        };
+        let pair = (message.guild_id.map_or(0, Id::get), message.author.id.get());
+        let mut state = self.state();
+        let Some(entry) = state.pairs.get_mut(&pair) else {
+            return;
+        };
+        match entry.before.take() {
+            Some((last, dropped)) => {
+                entry.last = last;
+                entry.dropped = dropped;
+            }
+            None => {
+                state.pairs.remove(&pair);
+            }
+        }
     }
 
     /// Forget the pairs whose window is over, at most once per
@@ -443,6 +484,64 @@ mod tests {
             Verdict::Drop(Reason::Window)
         );
         assert_eq!(filter.pairs(), 1);
+    }
+
+    #[test]
+    fn the_pair_cap_is_a_million_and_new_uses_it() {
+        assert_eq!(MAX_PAIRS, 1_000_000);
+        assert_eq!(ChatFilter::new(WINDOW).max_pairs, MAX_PAIRS);
+    }
+
+    #[test]
+    fn undo_restores_the_time_and_the_drop_count_of_a_published_message() {
+        let filter = ChatFilter::new(WINDOW);
+        let start = Instant::now();
+        let message = chat();
+        let data = message.to_string();
+        check_at(&filter, &message, start);
+        check_at(&filter, &message, start + ms(1));
+        check_at(&filter, &message, start + ms(2));
+
+        // Published with 2 dropped, then taken back: the same message comes
+        // again and finds the window as it was.
+        let again = start + WINDOW + ms(5);
+        assert_eq!(check_at(&filter, &message, again), publish(2));
+        filter.undo(&data);
+        assert_eq!(check_at(&filter, &message, again + ms(1)), publish(2));
+        assert_eq!(
+            check_at(&filter, &message, again + ms(2)),
+            Verdict::Drop(Reason::Window),
+            "and once published it starts the window"
+        );
+    }
+
+    #[test]
+    fn undo_forgets_a_pair_the_message_created() {
+        let filter = ChatFilter::new(WINDOW);
+        let start = Instant::now();
+        let message = chat();
+        assert_eq!(check_at(&filter, &message, start), publish(0));
+        filter.undo(&message.to_string());
+        assert_eq!(filter.pairs(), 0);
+        assert_eq!(check_at(&filter, &message, start + ms(1)), publish(0));
+    }
+
+    #[test]
+    fn undo_without_a_record_changes_nothing() {
+        // A full map that did not remember the pair, a zero window, a payload
+        // that cannot be read, and an unknown pair.
+        let full = ChatFilter::with_capacity(WINDOW, 1);
+        let start = Instant::now();
+        check_at(&full, &chat(), start);
+        let unremembered = from_user("11");
+        check_at(&full, &unremembered, start);
+        full.undo(&unremembered.to_string());
+        assert_eq!(full.pairs(), 1);
+
+        let none = ChatFilter::new(Duration::ZERO);
+        none.undo(&chat().to_string());
+        none.undo("not json");
+        assert_eq!(none.pairs(), 0);
     }
 
     #[test]

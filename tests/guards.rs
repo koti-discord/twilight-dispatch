@@ -1372,6 +1372,7 @@ async fn stale_jobs_follow_their_decision() {
         publish_errors: Throttle::default(),
         publish_events: None,
         chat_filter: None,
+        compact_message_create: false,
     };
     let fixtures = universe();
     let writes = STALE_WRITES.map(|label| (label, true));

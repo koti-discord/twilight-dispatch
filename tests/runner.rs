@@ -305,6 +305,7 @@ where
         publish_errors: Throttle::default(),
         publish_events: None,
         chat_filter: None,
+        compact_message_create: false,
     });
     let (queues, workers) = worker::spawn(opts.workers, worker_ctx);
     // Only the runner holds the queues: once it returns the workers drain and stop.

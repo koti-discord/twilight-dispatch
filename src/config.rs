@@ -46,12 +46,14 @@ pub struct Config {
     /// publishes every event. Events not listed are still cached and their
     /// sequence still completes; they are only not published.
     pub publish_events: Option<HashSet<String>>,
-    /// The chat source filter: `None` unless `CHAT_FILTER=true`, then the
-    /// window (`CHAT_FILTER_WINDOW_SECS`, default 0: no per-pair window).
+    /// The chat source filter: `None` unless `CHAT_FILTER=true`, then its
+    /// settings (the window `CHAT_FILTER_WINDOW_SECS`, default 0: no per-pair
+    /// window, and the compact payload `COMPACT_MESSAGE_CREATE`, which needs
+    /// the filter).
     /// `MESSAGE_CREATE` events from bots, webhooks and DMs, system messages,
     /// and repeats of a (guild, user) pair inside the window are then not
     /// published. They are still cached and their sequence still completes.
-    pub chat_filter: Option<Duration>,
+    pub chat_filter: Option<ChatFilterConfig>,
     /// Whether shards resume the sessions saved in Redis by the previous run
     /// (`RESUME`, default `true`). Only when `SHARDS_TOTAL` is set and the
     /// same as in that run.
@@ -119,6 +121,18 @@ pub struct Config {
     /// Posting the bot's server and shard counts to top.gg (`TOPGG_TOKEN`,
     /// `TOPGG_INTERVAL_SECS`); `None` when `TOPGG_TOKEN` is unset.
     pub topgg: Option<TopggConfig>,
+}
+
+/// What `CHAT_FILTER=true` turns on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChatFilterConfig {
+    /// How long after a published message the same (guild, user) pair's next
+    /// ones are dropped (`CHAT_FILTER_WINDOW_SECS`, default 0: no window).
+    pub window: Duration,
+    /// Publish `MESSAGE_CREATE` as the compact body (`COMPACT_MESSAGE_CREATE`,
+    /// default `false`). The body has no author or bot flag, so it is only
+    /// allowed with the filter that drops bots.
+    pub compact: bool,
 }
 
 /// A REST proxy address as twilight-http takes it.
@@ -593,12 +607,26 @@ impl Env<'_> {
         Ok(Some(names))
     }
 
-    /// `CHAT_FILTER` and `CHAT_FILTER_WINDOW_SECS`: the window when the filter
-    /// is on. The window is checked, as every other value, with the filter off.
-    fn chat_filter(&self) -> Result<Option<Duration>, ConfigError> {
+    /// `CHAT_FILTER`, `CHAT_FILTER_WINDOW_SECS` and `COMPACT_MESSAGE_CREATE`: the
+    /// settings when the filter is on. The values are checked, as every other
+    /// value, with the filter off too.
+    fn chat_filter(&self) -> Result<Option<ChatFilterConfig>, ConfigError> {
         let on = self.optional("CHAT_FILTER")?.unwrap_or(false);
         let secs: u64 = self.optional("CHAT_FILTER_WINDOW_SECS")?.unwrap_or(0);
-        Ok(on.then(|| Duration::from_secs(secs)))
+        let compact = self.optional("COMPACT_MESSAGE_CREATE")?.unwrap_or(false);
+        if compact && !on {
+            return Err(ConfigError::Invalid {
+                name: "COMPACT_MESSAGE_CREATE",
+                value: "true".into(),
+                reason: "needs CHAT_FILTER=true: the compact body has no author or bot flag, \
+                         so without the filter a consumer cannot tell bot messages apart"
+                    .into(),
+            });
+        }
+        Ok(on.then(|| ChatFilterConfig {
+            window: Duration::from_secs(secs),
+            compact,
+        }))
     }
 
     /// `SHARDS_START`, `SHARDS_END` and `SHARDS_TOTAL`: `None` when all three
@@ -1200,6 +1228,13 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("empty event name"), "{error}");
     }
 
+    fn filter(secs: u64, compact: bool) -> ChatFilterConfig {
+        ChatFilterConfig {
+            window: Duration::from_secs(secs),
+            compact,
+        }
+    }
+
     /// The chat filter is off, without a window, unless set.
     #[test]
     fn chat_filter_is_off_by_default_and_takes_a_window_in_seconds() {
@@ -1207,10 +1242,10 @@ pub(crate) mod tests {
         assert_eq!(config.chat_filter, None);
 
         let config = with(&[("CHAT_FILTER", "true"), ("CHAT_FILTER_WINDOW_SECS", "30")]).unwrap();
-        assert_eq!(config.chat_filter, Some(Duration::from_secs(30)));
+        assert_eq!(config.chat_filter, Some(filter(30, false)));
 
         let config = with(&[("CHAT_FILTER", "true")]).unwrap();
-        assert_eq!(config.chat_filter, Some(Duration::ZERO));
+        assert_eq!(config.chat_filter, Some(filter(0, false)));
 
         let config = with(&[("CHAT_FILTER_WINDOW_SECS", "30")]).unwrap();
         assert_eq!(config.chat_filter, None, "the window alone does nothing");
@@ -1223,6 +1258,36 @@ pub(crate) mod tests {
         assert_invalid(
             "CHAT_FILTER_WINDOW_SECS",
             &[("CHAT_FILTER_WINDOW_SECS", "soon")],
+        );
+    }
+
+    /// The compact payload is off by default, and only allowed with the chat
+    /// filter, which drops the bots its body cannot tell apart; the error names
+    /// both variables.
+    #[test]
+    fn the_compact_payload_needs_the_chat_filter() {
+        let on = [("CHAT_FILTER", "true"), ("COMPACT_MESSAGE_CREATE", "true")];
+        let config = with(&on).unwrap();
+        assert_eq!(config.chat_filter, Some(filter(0, true)));
+        let config = with(&[("CHAT_FILTER", "true"), ("COMPACT_MESSAGE_CREATE", "false")]).unwrap();
+        assert_eq!(config.chat_filter, Some(filter(0, false)));
+
+        for changes in [
+            &[("COMPACT_MESSAGE_CREATE", "true")][..],
+            &[("CHAT_FILTER", "false"), ("COMPACT_MESSAGE_CREATE", "true")],
+        ] {
+            let error = with(changes).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Invalid { name, .. } if *name == "COMPACT_MESSAGE_CREATE"),
+                "{error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("COMPACT_MESSAGE_CREATE"), "{message}");
+            assert!(message.contains("CHAT_FILTER=true"), "{message}");
+        }
+        assert_invalid(
+            "COMPACT_MESSAGE_CREATE",
+            &[("CHAT_FILTER", "true"), ("COMPACT_MESSAGE_CREATE", "maybe")],
         );
     }
 
