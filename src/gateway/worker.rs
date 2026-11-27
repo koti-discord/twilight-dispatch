@@ -577,6 +577,10 @@ where
                 dropped = count;
                 recorded = Some((filter, data.get()));
             }
+            // Published whole as before, unless consumers expect the compact
+            // shape: then it is not published at all.
+            Verdict::Unreadable if ctx.compact_message_create => return not_compact(ctx, shard),
+            Verdict::Unreadable => {}
         }
     }
     let undo = || {
@@ -586,18 +590,8 @@ where
     };
     let body = if ctx.compact_message_create && kind == "MESSAGE_CREATE" {
         let Some(body) = compact_body(ctx, conn, &envelope, dropped).await else {
-            // Consumers expect one shape: a message that does not fit it is
-            // not published, and counts as done like a filtered one.
-            COMPACT_UNREADABLE.inc();
-            if let Some(suppressed) = ctx.publish_errors.check() {
-                warn!(
-                    "[Shard {}] MESSAGE_CREATE does not fit the compact payload, not published \
-                     ({} similar errors suppressed)",
-                    shard, suppressed
-                );
-            }
             undo();
-            return true;
+            return not_compact(ctx, shard);
         };
         body
     } else {
@@ -627,6 +621,21 @@ where
     }
 }
 
+/// A `MESSAGE_CREATE` that does not fit the compact payload is not published,
+/// so that consumers see one shape. It counts as done, like a filtered one
+/// (always `true`).
+fn not_compact<C, P>(ctx: &WorkerContext<C, P>, shard: u32) -> bool {
+    COMPACT_UNREADABLE.inc();
+    if let Some(suppressed) = ctx.publish_errors.check() {
+        warn!(
+            "[Shard {}] MESSAGE_CREATE does not fit the compact payload, not published \
+             ({} similar errors suppressed)",
+            shard, suppressed
+        );
+    }
+    true
+}
+
 /// The compact body of a `MESSAGE_CREATE` (`COMPACT_MESSAGE_CREATE`), or
 /// `None` when it cannot be read into it (or serialized).
 async fn compact_body<C, P>(
@@ -647,6 +656,11 @@ where
 /// The parent channel of `channel` when the cache knows it as a thread of
 /// `guild` (`thread:<guild>:<channel>`). `None` when it is not one, when the
 /// cache is off or skipped, or when the read fails or times out.
+///
+/// The read goes through the breaker like a cache update: with it open the
+/// read is skipped (the message is published with no parent), a reply closes
+/// it, and a timeout or a lost connection opens it, so a stalled Redis does
+/// not hold every worker for the full timeout on every message.
 async fn thread_parent<C, P>(
     ctx: &WorkerContext<C, P>,
     conn: &mut C,
@@ -656,18 +670,28 @@ async fn thread_parent<C, P>(
 where
     C: ConnectionLike + Send,
 {
-    if !ctx.state.enabled || !ctx.breaker.allow() {
+    if !ctx.state.enabled {
         return None;
     }
+    let permit = ctx.breaker.permit()?;
     let key = thread_key(guild, channel);
     let read = cache::get(conn, &key);
     let reason = match tokio::time::timeout(ctx.cache_timeout, read).await {
         Ok(Ok(thread)) => {
+            permit.success();
             let thread = thread?;
             return Id::new_checked(thread.get("parent_id")?.as_str()?.parse().ok()?);
         }
-        Ok(Err(err)) => err.to_string(),
-        Err(_) => "timed out".to_owned(),
+        Ok(Err(err)) => {
+            if is_connection_error(&err) {
+                permit.failure();
+            }
+            err.to_string()
+        }
+        Err(_) => {
+            permit.failure();
+            "timed out".to_owned()
+        }
     };
     STATE_UPDATE_ERRORS.with_label_values(&["parent"]).inc();
     if let Some(suppressed) = ctx.cache_errors.check() {
@@ -817,6 +841,9 @@ mod tests {
 
     /// A thread's parent is `None` when the cache has nothing, is off or is
     /// being skipped, and when reading it fails or takes too long (counted).
+    /// The read answers to the breaker like a cache update: a reply closes
+    /// it, a timeout or a lost connection opens it, an error about the
+    /// command leaves it alone, and with it open the cache is not asked.
     #[tokio::test]
     async fn a_thread_without_a_readable_parent_has_none() {
         let (guild, channel) = (Id::new(1), Id::new(2));
@@ -826,11 +853,21 @@ mod tests {
         let mut conn = Fake::Empty;
         let ctx = half_open(conn, short);
         assert_eq!(thread_parent(&ctx, &mut conn, guild, channel).await, None);
+        assert!(
+            ctx.breaker.state().open_until.is_none(),
+            "a reply closes it"
+        );
 
         let before = errors();
-        for mut conn in [Fake::Rejected, Fake::Io(ErrorKind::BrokenPipe), Fake::Hang] {
+        for (mut conn, opens) in [
+            (Fake::Rejected, false),
+            (Fake::Io(ErrorKind::BrokenPipe), true),
+            (Fake::Hang, true),
+        ] {
             let ctx = half_open(conn, short);
             assert_eq!(thread_parent(&ctx, &mut conn, guild, channel).await, None);
+            assert_eq!(!ctx.breaker.allow(), opens, "{conn:?}");
+            assert!(!ctx.breaker.state().probing, "{conn:?} ends the probe");
         }
         assert_eq!(errors() - before, 3);
 

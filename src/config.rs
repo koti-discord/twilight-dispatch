@@ -541,6 +541,41 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Warnings about `PUBLISH_EVENTS` and the chat filter settings that
+    /// [`Config::from_lookup`] accepts, for the log at startup: an event name
+    /// twilight does not know (a typo never matches, though a Discord event
+    /// this build does not model is published as usual), and a
+    /// `CHAT_FILTER_WINDOW_SECS` that does nothing because `CHAT_FILTER` is
+    /// not on.
+    pub fn filter_warnings(lookup: Lookup<'_>) -> Vec<String> {
+        let env = Env(lookup);
+        let mut warnings = Vec::new();
+        if let Some(value) = env.string("PUBLISH_EVENTS") {
+            warnings.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| is_event_name(name) && EventType::try_from(*name).is_err())
+                    .map(|name| {
+                        format!(
+                            "PUBLISH_EVENTS lists {name}, which is not an event this build \
+                             knows: events of that name are published, but check it for a typo"
+                        )
+                    }),
+            );
+        }
+        let on = env.optional::<bool>("CHAT_FILTER").ok().flatten();
+        if env.string("CHAT_FILTER_WINDOW_SECS").is_some() && on != Some(true) {
+            warnings.push(
+                "CHAT_FILTER_WINDOW_SECS is set but CHAT_FILTER is not true, so it does nothing"
+                    .to_owned(),
+            );
+        }
+        warnings
+    }
+}
+
 /// Reported at startup when set, so deployments learn they can drop them.
 const OBSOLETE_VARIABLES: &[&str] = &["CLUSTERS", "SHARDS_WAIT"];
 
@@ -578,9 +613,12 @@ impl Env<'_> {
     }
 
     /// `PUBLISH_EVENTS`: the names of the dispatch events to publish, or `None`
-    /// when it is unset or blank. Every entry must be the name of a dispatch
-    /// event twilight knows, so an empty entry (a stray comma) and a misspelt
-    /// name are errors, not events that silently never match.
+    /// when it is unset or blank. Every entry must look like the name of a
+    /// dispatch event (`A-Z`, `0-9` and `_`), so an empty entry (a stray
+    /// comma) and a name with other characters are errors. A well-formed
+    /// name twilight does not know is accepted, as this gateway passes on
+    /// events twilight does not model; [`Config::filter_warnings`] reports it
+    /// at startup, so a typo is seen.
     fn publish_events(&self) -> Result<Option<HashSet<String>>, ConfigError> {
         let Some(value) = self.string("PUBLISH_EVENTS") else {
             return Ok(None);
@@ -594,11 +632,12 @@ impl Env<'_> {
                     reason: "empty event name (a stray comma?)".into(),
                 });
             }
-            if !is_dispatch_event(name) {
+            if !is_event_name(name) {
                 return Err(ConfigError::Invalid {
                     name: "PUBLISH_EVENTS",
                     value: name.to_owned(),
-                    reason: "not the name of a Discord dispatch event, such as MESSAGE_CREATE"
+                    reason: "not the name of a Discord dispatch event: expected capital \
+                             letters, digits and underscores, such as MESSAGE_CREATE"
                         .into(),
                 });
             }
@@ -617,7 +656,7 @@ impl Env<'_> {
         if compact && !on {
             return Err(ConfigError::Invalid {
                 name: "COMPACT_MESSAGE_CREATE",
-                value: "true".into(),
+                value: self.string("COMPACT_MESSAGE_CREATE").unwrap_or_default(),
                 reason: "needs CHAT_FILTER=true: the compact body has no author or bot flag, \
                          so without the filter a consumer cannot tell bot messages apart"
                     .into(),
@@ -818,9 +857,13 @@ impl Env<'_> {
     }
 }
 
-/// Whether `name` is a dispatch event twilight knows (`MESSAGE_CREATE`).
-fn is_dispatch_event(name: &str) -> bool {
-    EventType::try_from(name).is_ok()
+/// Whether `name` is made like the name of a dispatch event (`MESSAGE_CREATE`):
+/// capital letters, digits and underscores.
+fn is_event_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 /// An IP address, or `localhost` (accepted by earlier versions' examples).
@@ -1209,23 +1252,71 @@ pub(crate) mod tests {
             ["MESSAGE_CREATE", "GUILD_CREATE"].map(str::to_owned).into();
         assert_eq!(listed, expected);
 
+        // Well-formed names twilight does not model are accepted: this
+        // gateway passes such events on when the variable is unset.
+        let accepted = with(&[("PUBLISH_EVENTS", "GUILD_STICKERS_UPDATE,MADE_UP_EVENT_2")])
+            .unwrap()
+            .publish_events
+            .unwrap();
+        let expected: HashSet<String> = ["GUILD_STICKERS_UPDATE", "MADE_UP_EVENT_2"]
+            .map(str::to_owned)
+            .into();
+        assert_eq!(accepted, expected);
+
         for value in [
-            "MESSAGE_CREAT",
             "message_create",
+            "MESSAGE-CREATE",
+            "MESSAGE CREATE",
+            "MESSAGE_CREATE.",
             "MESSAGE_CREATE,",
             ",",
             "A,,B",
         ] {
             assert_invalid("PUBLISH_EVENTS", &[("PUBLISH_EVENTS", value)]);
         }
-        let error = with(&[("PUBLISH_EVENTS", "MESSAGE_CREATE,NOPE")]).unwrap_err();
+        let error = with(&[("PUBLISH_EVENTS", "MESSAGE_CREATE,nope")]).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "invalid environment variable PUBLISH_EVENTS=\"NOPE\": not the name of a \
-             Discord dispatch event, such as MESSAGE_CREATE"
+            "invalid environment variable PUBLISH_EVENTS=\"nope\": not the name of a \
+             Discord dispatch event: expected capital letters, digits and underscores, \
+             such as MESSAGE_CREATE"
         );
         let error = with(&[("PUBLISH_EVENTS", "MESSAGE_CREATE,,GUILD_CREATE")]).unwrap_err();
         assert!(error.to_string().contains("empty event name"), "{error}");
+    }
+
+    /// The warnings at startup: a name twilight does not know (a typo, or a
+    /// newer event), and a window that does nothing without the filter.
+    #[test]
+    fn filter_warnings_report_what_is_accepted_but_probably_wrong() {
+        let warnings = |changes: &[(&'static str, &str)]| {
+            let mut env = example_env();
+            env.extend(
+                changes
+                    .iter()
+                    .map(|&(name, value)| (name, value.to_owned())),
+            );
+            Config::filter_warnings(&|name| env.get(name).cloned())
+        };
+        assert!(warnings(&[]).is_empty());
+        assert!(warnings(&[("PUBLISH_EVENTS", "MESSAGE_CREATE, GUILD_CREATE")]).is_empty());
+
+        let unknown = warnings(&[(
+            "PUBLISH_EVENTS",
+            "MESSAGE_CREATE,MESSAGE_CREAT,GUILD_STICKERS_UPDATE",
+        )]);
+        assert_eq!(unknown.len(), 2, "{unknown:?}");
+        assert!(unknown[0].contains("MESSAGE_CREAT,"), "{unknown:?}");
+        assert!(unknown[1].contains("GUILD_STICKERS_UPDATE"), "{unknown:?}");
+
+        let window = warnings(&[("CHAT_FILTER_WINDOW_SECS", "30")]);
+        assert_eq!(window.len(), 1, "{window:?}");
+        assert!(window[0].contains("CHAT_FILTER_WINDOW_SECS"), "{window:?}");
+        assert_eq!(
+            warnings(&[("CHAT_FILTER", "false"), ("CHAT_FILTER_WINDOW_SECS", "30")]).len(),
+            1
+        );
+        assert!(warnings(&[("CHAT_FILTER", "true"), ("CHAT_FILTER_WINDOW_SECS", "30")]).is_empty());
     }
 
     fn filter(secs: u64, compact: bool) -> ChatFilterConfig {
@@ -1289,6 +1380,12 @@ pub(crate) mod tests {
             "COMPACT_MESSAGE_CREATE",
             &[("CHAT_FILTER", "true"), ("COMPACT_MESSAGE_CREATE", "maybe")],
         );
+
+        // The error shows the value as it was set.
+        match with(&[("COMPACT_MESSAGE_CREATE", " true ")]) {
+            Err(ConfigError::Invalid { value, .. }) => assert_eq!(value, " true "),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The metrics server binds PROMETHEUS_HOST, so it is resolved here; the

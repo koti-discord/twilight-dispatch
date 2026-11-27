@@ -102,6 +102,9 @@ fn serve() -> ExitCode {
     if let Some(warning) = Config::member_request_warning(&|name| std::env::var(name).ok()) {
         warn!("{}", warning);
     }
+    for warning in Config::filter_warnings(&|name| std::env::var(name).ok()) {
+        warn!("{}", warning);
+    }
 
     let result = runtime.block_on(app::run(config));
     // Don't wait for abandoned blocking work (DNS lookups) when exiting.

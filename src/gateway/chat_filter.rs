@@ -74,31 +74,37 @@ pub enum Verdict {
     /// Publish it. `dropped` is how many messages of its (guild, user) pair
     /// the window dropped since the pair's previous published message (the
     /// other rules do not count); the filter has reset it to zero. The
-    /// compact payload carries it.
+    /// compact payload carries it. A count that waited at least twice the
+    /// window for the pair's next message is stale and reported as 0.
     Publish {
         /// The window's drops since the pair's previous published message.
         dropped: u32,
     },
     /// Do not publish it.
     Drop(Reason),
+    /// The rules could not read the message (no author, an id that is not a
+    /// snowflake, a flag of the wrong type). Nothing was recorded. Published
+    /// whole as before; with the compact payload on it is not published.
+    Unreadable,
 }
 
-/// The fields of a `MESSAGE_CREATE` the rules read. A payload that does not
-/// have them (the model would not accept it either) is published.
+/// The fields of a `MESSAGE_CREATE` the rules read. A `null` or absent `bot`
+/// or `type` is what Discord sends for a plain message, so they are optional
+/// and the type is read as a wide integer (one above 255 is not chat).
 #[derive(Deserialize)]
 struct Message {
     guild_id: Option<Id<GuildMarker>>,
     author: Author,
     webhook_id: Option<IgnoredAny>,
     #[serde(rename = "type", default)]
-    kind: u8,
+    kind: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct Author {
     id: Id<UserMarker>,
     #[serde(default)]
-    bot: bool,
+    bot: Option<bool>,
 }
 
 /// When a pair's last message was published, and how many were dropped since.
@@ -143,16 +149,15 @@ impl ChatFilter {
     }
 
     /// Decide on the `MESSAGE_CREATE` whose `d` is `data` (the raw JSON).
-    /// A `d` that cannot be read is published.
     pub fn check(&self, data: &str) -> Verdict {
         self.check_at(data, Instant::now())
     }
 
     fn check_at(&self, data: &str, now: Instant) -> Verdict {
         let Ok(message) = serde_json::from_str::<Message>(data) else {
-            return Verdict::Publish { dropped: 0 };
+            return Verdict::Unreadable;
         };
-        if message.author.bot {
+        if message.author.bot == Some(true) {
             return Verdict::Drop(Reason::Bot);
         }
         if message.webhook_id.is_some() {
@@ -161,7 +166,9 @@ impl ChatFilter {
         let Some(guild) = message.guild_id else {
             return Verdict::Drop(Reason::Dm);
         };
-        if !CHAT_TYPES.contains(&message.kind) {
+        let chat =
+            u8::try_from(message.kind.unwrap_or(0)).is_ok_and(|kind| CHAT_TYPES.contains(&kind));
+        if !chat {
             return Verdict::Drop(Reason::System);
         }
         self.window_at((guild.get(), message.author.id.get()), now)
@@ -180,9 +187,13 @@ impl ChatFilter {
                 return Verdict::Drop(Reason::Window);
             }
             let dropped = std::mem::take(&mut entry.dropped);
+            // A count that waited this long is not a recent burst.
+            let aged = now.saturating_duration_since(entry.last) >= self.window.saturating_mul(2);
             entry.before = Some((entry.last, dropped));
             entry.last = now;
-            return Verdict::Publish { dropped };
+            return Verdict::Publish {
+                dropped: if aged { 0 } else { dropped },
+            };
         }
         // A new pair. A full map first forgets the pairs whose window is over
         // (they would publish anyway); if it is still full the pair is not
@@ -204,12 +215,12 @@ impl ChatFilter {
     }
 
     /// Take back the record of the message with this `data` that
-    /// [`ChatFilter::check`] just published, because the broker did not take
-    /// it: the pair's last published time and drop count are what they were
-    /// before it, or the pair is forgotten when that message created it. The
-    /// message comes again (the resume point stayed before it) and must be
-    /// published again with the same `dropped`, not dropped as a repeat of
-    /// itself.
+    /// [`ChatFilter::check`] just let through, because it was not published
+    /// after all (the broker did not take it): the pair's last published time
+    /// and drop count are what they were before it, or the pair is forgotten
+    /// when that message created it. So the window does not run from a message
+    /// nobody received: the pair's next message is published at once, and
+    /// carries the restored count.
     ///
     /// Call it right after the failed publish, before the pair's next message
     /// is checked: one worker processes a guild's events one at a time, so
@@ -297,6 +308,7 @@ mod tests {
         match ChatFilter::new(Duration::ZERO).check(&message.to_string()) {
             Verdict::Drop(reason) => Some(reason),
             Verdict::Publish { .. } => None,
+            Verdict::Unreadable => panic!("unreadable: {message}"),
         }
     }
 
@@ -339,12 +351,31 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_that_cannot_be_read_is_published() {
+    fn a_payload_that_cannot_be_read_is_unreadable() {
         let filter = ChatFilter::new(WINDOW);
-        for data in ["{}", "not json", r#"{"author":{"id":"x"}}"#] {
-            assert_eq!(filter.check(data), publish(0), "{data}");
+        for data in [
+            "{}",
+            "not json",
+            r#"{"author":{"id":"x"}}"#,
+            r#"{"guild_id":"1","author":{"id":"3","bot":"yes"}}"#,
+            r#"{"guild_id":"1","author":{"id":"3"},"type":"x"}"#,
+        ] {
+            assert_eq!(filter.check(data), Verdict::Unreadable, "{data}");
         }
         assert_eq!(filter.pairs(), 0);
+    }
+
+    #[test]
+    fn a_null_bot_flag_is_no_bot_and_a_huge_type_is_no_chat() {
+        let mut null_bot = chat();
+        null_bot["author"]["bot"] = Value::Null;
+        assert_eq!(drop_of(&null_bot), None);
+        let mut null_type = chat();
+        null_type["type"] = Value::Null;
+        assert_eq!(drop_of(&null_type), None);
+        let mut huge = chat();
+        huge["type"] = json!(300);
+        assert_eq!(drop_of(&huge), Some(Reason::System));
     }
 
     #[test]
@@ -502,8 +533,9 @@ mod tests {
         check_at(&filter, &message, start + ms(1));
         check_at(&filter, &message, start + ms(2));
 
-        // Published with 2 dropped, then taken back: the same message comes
-        // again and finds the window as it was.
+        // Published with 2 dropped, then taken back because the broker did
+        // not take it: the pair's next message finds the window as it was, so
+        // it is published at once and carries the 2.
         let again = start + WINDOW + ms(5);
         assert_eq!(check_at(&filter, &message, again), publish(2));
         filter.undo(&data);
@@ -512,6 +544,33 @@ mod tests {
             check_at(&filter, &message, again + ms(2)),
             Verdict::Drop(Reason::Window),
             "and once published it starts the window"
+        );
+    }
+
+    #[test]
+    fn a_count_that_waited_twice_the_window_is_reported_as_zero() {
+        let start = Instant::now();
+        let message = chat();
+        let fresh = |at: Instant| {
+            let filter = ChatFilter::new(WINDOW);
+            check_at(&filter, &message, start);
+            check_at(&filter, &message, start + ms(1));
+            check_at(&filter, &message, start + ms(2));
+            (check_at(&filter, &message, at), filter)
+        };
+        assert_eq!(fresh(start + WINDOW * 2 - ms(1)).0, publish(2));
+        let (verdict, filter) = fresh(start + WINDOW * 2);
+        assert_eq!(verdict, publish(0), "stale: not a recent burst");
+        assert_eq!(
+            check_at(&filter, &message, start + WINDOW * 2 + ms(1)),
+            Verdict::Drop(Reason::Window),
+            "the window still started"
+        );
+        // Undo keeps the count, as the next message may come sooner.
+        filter.undo(&message.to_string());
+        assert_eq!(
+            check_at(&filter, &message, start + WINDOW * 2 - ms(1)),
+            publish(2)
         );
     }
 

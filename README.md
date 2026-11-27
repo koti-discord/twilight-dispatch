@@ -26,8 +26,10 @@ as `MESSAGE_CREATE,GUILD_CREATE,GUILD_DELETE`) limits what is published: only
 the listed events go to the exchange. Every other event is still applied to the
 state cache and still completes its sequence number, so the saved resume point
 keeps advancing; it is just not sent to the broker. Unset, every event is
-published. An empty entry or a name that is not a dispatch event is a
-configuration error.
+published. An empty entry, or a name with anything but capital letters, digits and
+underscores, is a configuration error. A well-formed name this build does not
+know is accepted (events twilight does not model are published when the
+variable is unset), and logged as a warning at startup so a typo is seen.
 
 `CHAT_FILTER=true` (off by default) leaves out of the published events the
 `MESSAGE_CREATE` events that are not chat: those from bots (`author.bot`), from
@@ -38,8 +40,11 @@ type except 0, default, and 19, reply). With `CHAT_FILTER_WINDOW_SECS` above 0
 starts at each published message. The filter remembers at most 1000000 pairs in
 memory (roughly 100 to 150 MB), forgetting those whose window is over first;
 with more live pairs than that, a new pair is published without being
-remembered. A message whose publish failed does not start its window: it comes
-again after a resume or restart and is published then. Like an event left out
+remembered. A drop count that waited at least twice the window for the pair's
+next message is stale and reported as 0 (see `COMPACT_MESSAGE_CREATE`). A
+message whose publish failed does not start its window: the pair's next
+message is published at once, with the count the failed one would have carried.
+Like an event left out
 by `PUBLISH_EVENTS` (which is checked first), a filtered message is still
 applied to the state cache and still completes its sequence number. They are
 counted in `gateway_chat_filtered{reason}` (`bot`, `webhook`, `dm`, `system`,
@@ -63,8 +68,9 @@ knows, and `null` otherwise. The state cache must be on (`STATE_ENABLED`) for
 parent ids: with it off `parent_id` is always `null`, and so it is when Redis
 cannot be read (counted in `state_update_errors{reason="parent"}`). `dropped` is
 how many messages of the same (guild, user) pair the window dropped since the
-previous one that was published (0 without a window). A `MESSAGE_CREATE` that
-cannot be read into this shape is not published, so that consumers see one
+previous one that was published (0 without a window, and when the pair's count
+waited twice the window or longer). A `MESSAGE_CREATE` that cannot be read into
+this shape, or that the filter cannot read, is not published, so that consumers see one
 shape: it completes its sequence number like a filtered message, is logged
 (rate limited) and counted in `gateway_compact_unreadable`. Other events are
 published whole.

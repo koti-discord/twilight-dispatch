@@ -363,6 +363,7 @@ async fn only_listed_events_are_published_but_every_event_is_cached_and_complete
     assert_eq!(get(&mut conn, "guild:1000").await.unwrap()["name"], "g");
     assert_eq!(recorder.published(), [], "GUILD_CREATE is not listed");
     assert_eq!(handle.in_flight(), 0, "but its sequence completed");
+    assert_eq!(resume_point(&handle), 2, "the resume point passed it");
 
     let delete = job(&handle, "GUILD_DELETE", 3, json!({"id": "1000"}));
     worker::process(&ctx, &mut conn, delete).await;
@@ -372,6 +373,7 @@ async fn only_listed_events_are_published_but_every_event_is_cached_and_complete
         [("GUILD_DELETE".to_owned(), Some("0:s1:3".to_owned()))]
     );
     assert_eq!(handle.in_flight(), 0);
+    assert_eq!(resume_point(&handle), 3);
 }
 
 /// The allow-list needs only the event name: a job without a typed event
@@ -402,6 +404,14 @@ async fn the_allow_list_applies_without_the_cache() {
         recorder.published(),
         [("B".to_owned(), Some("0::3".to_owned()))]
     );
+}
+
+/// The sequence the saved session would resume from. `fail` completes a token
+/// before it records the failure, so `in_flight()` cannot tell a completed
+/// token from a failed one; the resume point stays before a failed one.
+fn resume_point(handle: &ShardHandle) -> u64 {
+    handle.update(|snapshot| snapshot.session_id = Some("s1".to_owned()));
+    handle.session_info().expect("a resumable session").sequence
 }
 
 /// A `MESSAGE_CREATE` of shard 0 in channel 3 of guild 1000 by user 1.
@@ -451,6 +461,11 @@ async fn filtered_messages_are_cached_and_complete_their_sequence() {
         assert!(get(&mut conn, &key).await.is_some(), "{key} is cached");
     }
     assert_eq!(handle.in_flight(), 0, "every sequence completed");
+    assert_eq!(
+        resume_point(&handle),
+        4,
+        "the resume point passed all three"
+    );
     assert_eq!(filtered("window") - repeats, 1);
     assert_eq!(filtered("bot") - bots, 1);
 }
@@ -608,16 +623,16 @@ async fn the_compact_body_carries_the_dropped_count() {
         recorder.clone(),
         &handle,
         state_all(),
-        Duration::from_secs(1),
+        Duration::from_millis(400),
     );
 
     for seq in 2..=4 {
         worker::process(&ctx, &mut conn, message_job(&handle, seq, 3, 1)).await;
     }
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 5, 3, 1)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 6, 3, 1)).await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 7, 3, 1)).await;
 
     let dropped: Vec<_> = recorder
@@ -629,10 +644,12 @@ async fn the_compact_body_carries_the_dropped_count() {
     assert_eq!(handle.in_flight(), 0);
 }
 
-/// A message whose publish failed comes again (the resume point stayed before
-/// it): it is published then, with the `dropped` of the first attempt, not
-/// dropped as a repeat of itself. The same holds for the first message of a
-/// pair.
+/// A message whose publish failed does not start the window: the pair's next
+/// message is published at once, with the `dropped` the failed one would have
+/// carried. The same holds for the first message of a pair.
+///
+/// The windows are a few hundred milliseconds: the waits are between one and
+/// two windows (a count older than two is reported as 0).
 #[tokio::test]
 async fn a_failed_publish_does_not_start_the_window() {
     let _serial = SERIAL.lock().await;
@@ -646,13 +663,13 @@ async fn a_failed_publish_does_not_start_the_window() {
         recorder.clone(),
         &handle,
         state_all(),
-        Duration::from_secs(1),
+        Duration::from_millis(400),
     );
 
     worker::process(&ctx, &mut conn, message_job(&handle, 2, 3, 1)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 3, 3, 1)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 4, 3, 1)).await;
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     // The next two publishes fail: user 1's third message (which would carry
     // the 2 dropped) and user 2's first.
@@ -730,6 +747,7 @@ async fn an_unreadable_message_is_not_published_and_completes_its_sequence() {
     worker::process(&ctx, &mut NoRedis, unreadable).await;
     assert!(recorder.published().is_empty());
     assert_eq!(handle.in_flight(), 0, "its sequence completed");
+    assert_eq!(resume_point(&handle), 2, "the resume point passed it");
     assert_eq!(COMPACT_UNREADABLE.get() - before, 1);
 
     // Nothing was recorded for the pair; with the cache off the parent is null.
@@ -748,6 +766,81 @@ async fn an_unreadable_message_is_not_published_and_completes_its_sequence() {
     assert_eq!(bodies.len(), 1);
     assert_eq!(data_of(&bodies[0])["parent_id"], Value::Null);
     assert_eq!(data_of(&bodies[0])["dropped"], 0);
+    assert_eq!(resume_point(&handle), 3);
+}
+
+/// A read of the thread's parent goes through the breaker like a cache
+/// update: with it open the cache is not asked, and the message is still
+/// published, with a null parent.
+#[tokio::test]
+async fn with_the_breaker_open_a_compact_message_is_published_without_a_parent() {
+    let _serial = SERIAL.lock().await;
+    let Some(mut conn) = redis(12).await else {
+        return;
+    };
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let ctx = compact_context(
+        conn.clone(),
+        recorder.clone(),
+        &handle,
+        state_all(),
+        Duration::ZERO,
+    );
+    let create = job(&handle, "GUILD_CREATE", 2, guild(1000, "g"));
+    worker::process(&ctx, &mut conn, create).await;
+
+    ctx.breaker.failure();
+    worker::process(&ctx, &mut conn, message_job(&handle, 3, 1005, 7)).await;
+    let bodies = recorder.bodies();
+    assert_eq!(bodies.len(), 2, "published");
+    assert_eq!(data_of(&bodies[1])["parent_id"], Value::Null);
+    assert!(!ctx.breaker.allow(), "and the breaker is still open");
+    assert_eq!(resume_point(&handle), 3);
+}
+
+/// A message the filter cannot read (a `bot` flag that is no boolean) skips
+/// the bot rule, so with the compact payload on it is not published; with it
+/// off it is published whole, as before.
+#[tokio::test]
+async fn a_message_the_filter_cannot_read_is_not_published_compact() {
+    let _serial = SERIAL.lock().await;
+    let handle = Arc::new(ShardHandle::new(0, None, Some(1)));
+    let recorder = Arc::new(Recorder::default());
+    let mut ctx = compact_context(
+        NoRedis,
+        recorder.clone(),
+        &handle,
+        StateConfig::default(),
+        Duration::from_secs(3600),
+    );
+    let before = COMPACT_UNREADABLE.get();
+    let unreadable = |seq: u64| {
+        let mut d = message(seq, 3, Some(1000), "hi");
+        d["author"] = common::user(1, "author");
+        d["author"]["bot"] = json!("yes");
+        Job {
+            shard: 0,
+            seq: Some(seq),
+            token: handle.dispatch(seq),
+            session: Some(Arc::from("s1")),
+            json: raw("MESSAGE_CREATE", seq, d),
+            event: None,
+        }
+    };
+
+    worker::process(&ctx, &mut NoRedis, unreadable(2)).await;
+    assert!(recorder.published().is_empty());
+    assert_eq!(COMPACT_UNREADABLE.get() - before, 1);
+    assert_eq!(resume_point(&handle), 2, "its sequence completed");
+
+    ctx.compact_message_create = false;
+    worker::process(&ctx, &mut NoRedis, unreadable(3)).await;
+    let bodies = recorder.bodies();
+    assert_eq!(bodies.len(), 1, "published whole");
+    assert_eq!(data_of(&bodies[0])["author"]["bot"], "yes");
+    assert_eq!(COMPACT_UNREADABLE.get() - before, 1);
+    assert_eq!(resume_point(&handle), 3);
 }
 
 /// `spawn` starts at least one worker even for a count of 0 (the runner
