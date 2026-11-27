@@ -152,6 +152,9 @@ fn context<P>(
         breaker: Breaker::default(),
         cache_errors: Throttle::default(),
         publish_errors: Throttle::default(),
+        publish_events: None,
+        chat_filter: None,
+        compact_message_create: false,
     }
 }
 

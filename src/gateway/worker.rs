@@ -7,12 +7,18 @@
 //! failed update is not applied, and one that timed out may still be applied
 //! after the event was published). Different guilds are processed in parallel.
 
-use super::{payload, registry::Registry, seq::SeqToken};
+use super::{
+    chat_filter::{ChatFilter, Verdict},
+    payload,
+    registry::Registry,
+    seq::SeqToken,
+};
 use crate::{
     cache::{self, Outcome, UpdateContext},
     config::StateConfig,
+    constants::thread_key,
     discord_log::DiscordLog,
-    metrics::{GUILD_EVENTS, STATE_UPDATE_ERRORS},
+    metrics::{CHAT_FILTERED, COMPACT_UNREADABLE, GUILD_EVENTS, STATE_UPDATE_ERRORS},
     models::{ApiError, ApiResult, FormattedDateTime},
     util::Throttle,
 };
@@ -20,6 +26,7 @@ use crate::{
 use redis::aio::ConnectionLike;
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     future::Future,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
@@ -28,7 +35,10 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::warn;
 use twilight_model::{
     gateway::{event::Event, payload::incoming::GuildCreate},
-    id::{marker::UserMarker, Id},
+    id::{
+        marker::{ChannelMarker, GuildMarker, UserMarker},
+        Id,
+    },
 };
 
 /// Per-worker queue length. A shard whose next event does not fit its
@@ -219,6 +229,16 @@ pub struct WorkerContext<C, P> {
     pub cache_errors: Throttle,
     /// Rate limit for the warnings about failed publishes.
     pub publish_errors: Throttle,
+    /// The events to publish (`PUBLISH_EVENTS`); `None` publishes every event.
+    /// The others are cached and complete their sequence like a published one.
+    pub publish_events: Option<HashSet<String>>,
+    /// The chat source filter (`CHAT_FILTER`), shared by every worker; `None`
+    /// when it is off. A message it drops is cached and completes its
+    /// sequence like one left out by `publish_events`.
+    pub chat_filter: Option<ChatFilter>,
+    /// Publish `MESSAGE_CREATE` as the compact body (`COMPACT_MESSAGE_CREATE`).
+    /// Needs `chat_filter`, which supplies the dropped count.
+    pub compact_message_create: bool,
 }
 
 /// Start `count` workers (at least one: the runner indexes into the returned
@@ -288,7 +308,15 @@ where
         Some(session) => format!("{shard}:{session}:{seq}"),
         None => format!("{shard}::{seq}"),
     });
-    let published = publish(ctx, shard, message_id, &json, outcome.and_then(|o| o.old)).await;
+    let published = publish(
+        ctx,
+        conn,
+        shard,
+        message_id,
+        &json,
+        outcome.and_then(|o| o.old),
+    )
+    .await;
 
     if let (Some(token), Some(handle)) = (token, handle) {
         if published {
@@ -499,19 +527,22 @@ fn log_guild_changes<C, P>(ctx: &WorkerContext<C, P>, event: &Event, outcome: Op
     }
 }
 
-/// Publish a payload. Returns false only when the publisher failed (for the
+/// Publish a payload, unless `PUBLISH_EVENTS` leaves its event out (that counts
+/// as done). Returns false only when the publisher failed (for the
 /// broker: shutting down, unreachable past the outage budget, a write timeout
 /// or error, or with `AMQP_CONFIRMS` a nack or missing confirm), so the resume
 /// point stays before it. Payloads that cannot be published at all are logged
 /// and count as done.
 async fn publish<C, P>(
     ctx: &WorkerContext<C, P>,
+    conn: &mut C,
     shard: u32,
     message_id: Option<String>,
     json: &str,
     old: Option<Value>,
 ) -> bool
 where
+    C: ConnectionLike + Send,
     P: Publisher,
 {
     let envelope = match payload::Envelope::parse(json) {
@@ -524,11 +555,53 @@ where
     let Some(kind) = envelope.kind() else {
         return true;
     };
-    let body = match payload::outgoing(&envelope, old.as_ref()) {
-        Ok(body) => body,
-        Err(err) => {
-            warn!("[Shard {}] Failed to serialize payload: {}", shard, err);
-            return true;
+    if ctx
+        .publish_events
+        .as_ref()
+        .is_some_and(|events| !events.contains(kind))
+    {
+        // Not on the allow-list: done, so the resume point passes it.
+        return true;
+    }
+    // The filter has recorded a message it lets through; if that message is
+    // not published after all, the record is taken back (see `ChatFilter::undo`).
+    let mut recorded = None;
+    let mut dropped = 0;
+    if let (Some(filter), "MESSAGE_CREATE", Some(data)) = (&ctx.chat_filter, kind, envelope.d) {
+        match filter.check(data.get()) {
+            Verdict::Drop(reason) => {
+                CHAT_FILTERED.with_label_values(&[reason.label()]).inc();
+                return true;
+            }
+            Verdict::Publish { dropped: count } => {
+                dropped = count;
+                recorded = Some((filter, data.get()));
+            }
+            // Published whole as before, unless consumers expect the compact
+            // shape: then it is not published at all.
+            Verdict::Unreadable if ctx.compact_message_create => return not_compact(ctx, shard),
+            Verdict::Unreadable => {}
+        }
+    }
+    let undo = || {
+        if let Some((filter, data)) = recorded {
+            filter.undo(data);
+        }
+    };
+    let body = if ctx.compact_message_create && kind == "MESSAGE_CREATE" {
+        let Some(body) = compact_body(ctx, conn, &envelope, dropped).await else {
+            undo();
+            return not_compact(ctx, shard);
+        };
+        body
+    } else {
+        match payload::outgoing(&envelope, old.as_ref()) {
+            Ok(body) => body,
+            Err(err) => {
+                warn!("[Shard {}] Failed to serialize payload: {}", shard, err);
+                undo();
+                return true;
+            }
         }
     };
     match ctx.publisher.publish(kind, body, message_id).await {
@@ -540,9 +613,94 @@ where
                     shard, err, suppressed
                 );
             }
+            // The event comes again after a restart or a resume; it must not
+            // find its own record in the window.
+            undo();
             false
         }
     }
+}
+
+/// A `MESSAGE_CREATE` that does not fit the compact payload is not published,
+/// so that consumers see one shape. It counts as done, like a filtered one
+/// (always `true`).
+fn not_compact<C, P>(ctx: &WorkerContext<C, P>, shard: u32) -> bool {
+    COMPACT_UNREADABLE.inc();
+    if let Some(suppressed) = ctx.publish_errors.check() {
+        warn!(
+            "[Shard {}] MESSAGE_CREATE does not fit the compact payload, not published \
+             ({} similar errors suppressed)",
+            shard, suppressed
+        );
+    }
+    true
+}
+
+/// The compact body of a `MESSAGE_CREATE` (`COMPACT_MESSAGE_CREATE`), or
+/// `None` when it cannot be read into it (or serialized).
+async fn compact_body<C, P>(
+    ctx: &WorkerContext<C, P>,
+    conn: &mut C,
+    envelope: &payload::Envelope<'_>,
+    dropped: u32,
+) -> Option<Vec<u8>>
+where
+    C: ConnectionLike + Send,
+{
+    let compact = payload::Compact::read(envelope.d?)?;
+    let parent = thread_parent(ctx, conn, compact.guild_id(), compact.channel_id()).await;
+    let compact = compact.with_parent(parent).with_dropped(dropped);
+    payload::compact_outgoing(envelope, &compact).ok()
+}
+
+/// The parent channel of `channel` when the cache knows it as a thread of
+/// `guild` (`thread:<guild>:<channel>`). `None` when it is not one, when the
+/// cache is off or skipped, or when the read fails or times out.
+///
+/// The read goes through the breaker like a cache update: with it open the
+/// read is skipped (the message is published with no parent), a reply closes
+/// it, and a timeout or a lost connection opens it, so a stalled Redis does
+/// not hold every worker for the full timeout on every message.
+async fn thread_parent<C, P>(
+    ctx: &WorkerContext<C, P>,
+    conn: &mut C,
+    guild: Id<GuildMarker>,
+    channel: Id<ChannelMarker>,
+) -> Option<Id<ChannelMarker>>
+where
+    C: ConnectionLike + Send,
+{
+    if !ctx.state.enabled {
+        return None;
+    }
+    let permit = ctx.breaker.permit()?;
+    let key = thread_key(guild, channel);
+    let read = cache::get(conn, &key);
+    let reason = match tokio::time::timeout(ctx.cache_timeout, read).await {
+        Ok(Ok(thread)) => {
+            permit.success();
+            let thread = thread?;
+            return Id::new_checked(thread.get("parent_id")?.as_str()?.parse().ok()?);
+        }
+        Ok(Err(err)) => {
+            if is_connection_error(&err) {
+                permit.failure();
+            }
+            err.to_string()
+        }
+        Err(_) => {
+            permit.failure();
+            "timed out".to_owned()
+        }
+    };
+    STATE_UPDATE_ERRORS.with_label_values(&["parent"]).inc();
+    if let Some(suppressed) = ctx.cache_errors.check() {
+        warn!(
+            "Failed to read thread {} for its parent: {} ({} similar errors suppressed)",
+            channel, reason, suppressed
+        );
+    }
+    None
 }
 
 #[cfg(test)]
@@ -664,6 +822,9 @@ mod tests {
             breaker: Breaker::default(),
             cache_errors: Throttle::default(),
             publish_errors: Throttle::default(),
+            publish_events: None,
+            chat_filter: None,
+            compact_message_create: false,
         };
         ctx.breaker.state().open_until = Some(Instant::now());
         ctx
@@ -676,6 +837,51 @@ mod tests {
             guild_id: None,
             id: Id::new(2),
         })
+    }
+
+    /// A thread's parent is `None` when the cache has nothing, is off or is
+    /// being skipped, and when reading it fails or takes too long (counted).
+    /// The read answers to the breaker like a cache update: a reply closes
+    /// it, a timeout or a lost connection opens it, an error about the
+    /// command leaves it alone, and with it open the cache is not asked.
+    #[tokio::test]
+    async fn a_thread_without_a_readable_parent_has_none() {
+        let (guild, channel) = (Id::new(1), Id::new(2));
+        let short = Duration::from_millis(10);
+        let errors = || STATE_UPDATE_ERRORS.with_label_values(&["parent"]).get();
+
+        let mut conn = Fake::Empty;
+        let ctx = half_open(conn, short);
+        assert_eq!(thread_parent(&ctx, &mut conn, guild, channel).await, None);
+        assert!(
+            ctx.breaker.state().open_until.is_none(),
+            "a reply closes it"
+        );
+
+        let before = errors();
+        for (mut conn, opens) in [
+            (Fake::Rejected, false),
+            (Fake::Io(ErrorKind::BrokenPipe), true),
+            (Fake::Hang, true),
+        ] {
+            let ctx = half_open(conn, short);
+            assert_eq!(thread_parent(&ctx, &mut conn, guild, channel).await, None);
+            assert_eq!(!ctx.breaker.allow(), opens, "{conn:?}");
+            assert!(!ctx.breaker.state().probing, "{conn:?} ends the probe");
+        }
+        assert_eq!(errors() - before, 3);
+
+        let mut conn = Fake::Rejected;
+        let mut off = half_open(conn, short);
+        off.state.enabled = false;
+        assert_eq!(thread_parent(&off, &mut conn, guild, channel).await, None);
+        let skipping = half_open(conn, short);
+        skipping.breaker.failure();
+        assert_eq!(
+            thread_parent(&skipping, &mut conn, guild, channel).await,
+            None
+        );
+        assert_eq!(errors() - before, 3, "neither read the cache");
     }
 
     #[tokio::test]

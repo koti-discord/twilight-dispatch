@@ -308,6 +308,17 @@ counter_vec!(
     &["type"]
 );
 counter_vec!(
+    CHAT_FILTERED,
+    "gateway_chat_filtered",
+    "MESSAGE_CREATE events the chat filter did not publish (bot, webhook, dm, system, window)",
+    &["reason"]
+);
+counter!(
+    COMPACT_UNREADABLE,
+    "gateway_compact_unreadable",
+    "MESSAGE_CREATE events not published because they do not fit the compact payload"
+);
+counter_vec!(
     STATE_UPDATE_ERRORS,
     "state_update_errors",
     "Failed or skipped state cache updates",
@@ -373,6 +384,8 @@ static ALL: &[&dyn Register] = &[
     &STATE_THREADS,
     &GATEWAY_PARSE_ERRORS,
     &STATE_UPDATE_ERRORS,
+    &CHAT_FILTERED,
+    &COMPACT_UNREADABLE,
     &AMQP_PUBLISH_FAILURES,
     &AMQP_RECONNECTS,
     &GATEWAY_COMMANDS,

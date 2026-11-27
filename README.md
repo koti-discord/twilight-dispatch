@@ -21,6 +21,62 @@ posts a message to a channel through Discord's REST API (see Operations).
 Configuration is read from environment variables (or `.env`); see
 [`.env.example`](.env.example).
 
+`PUBLISH_EVENTS` (optional, a comma-separated list of dispatch event names such
+as `MESSAGE_CREATE,GUILD_CREATE,GUILD_DELETE`) limits what is published: only
+the listed events go to the exchange. Every other event is still applied to the
+state cache and still completes its sequence number, so the saved resume point
+keeps advancing; it is just not sent to the broker. Unset, every event is
+published. An empty entry, or a name with anything but capital letters,
+digits and underscores, is a configuration error. A well-formed name this
+build does not know is accepted (events twilight does not model are published
+when the variable is unset), and logged as a warning at startup so a typo is
+seen; so are names that are never the type of a dispatched event
+(`UNAVAILABLE_GUILD`, `GATEWAY_*`).
+
+`CHAT_FILTER=true` (off by default) leaves out of the published events the
+`MESSAGE_CREATE` events that are not chat: those from bots (`author.bot`), from
+webhooks (`webhook_id`), DMs (no `guild_id`) and system messages (any message
+type except 0, default, and 19, reply). With `CHAT_FILTER_WINDOW_SECS` above 0
+(default 0, no window) a message is also left out when a message of the same
+(guild, user) pair was published less than that many seconds before; the window
+starts at each published message. The filter remembers at most 1000000 pairs in
+memory (roughly 100 to 150 MB), forgetting those whose window is over first;
+with more live pairs than that, a new pair is published without being
+remembered. A drop count that waited at least twice the window for the pair's
+next message is stale and reported as 0 (see `COMPACT_MESSAGE_CREATE`). A
+message whose publish failed does not start its window: the pair's next
+message is published at once, with the count the failed one would have carried
+(if it comes within twice the window). Like an event left out by
+`PUBLISH_EVENTS` (which is checked first), a filtered message is still applied
+to the state cache and still completes its sequence number. They are
+counted in `gateway_chat_filtered{reason}` (`bot`, `webhook`, `dm`, `system`,
+`window`).
+
+The gateway's drop is final: a dropped message is never published and the
+consumer cannot get it back. `CHAT_FILTER_WINDOW_SECS` should therefore not be
+longer than the consumer's own cooldown for the same (guild, user), or messages
+the consumer would have accepted are lost.
+
+`COMPACT_MESSAGE_CREATE=true` (off by default) publishes `MESSAGE_CREATE` as a
+small body, for consumers that only need to know who spoke where and when. It
+needs `CHAT_FILTER=true`: the gateway refuses to start with it on and the filter
+off, because the compact body has no author or bot flag, so without the filter
+a consumer could not tell bot messages apart. The envelope
+(`{"op", "t", "d"}`), the routing key and the message id are unchanged, and `d`
+is exactly `guild_id`, `channel_id`, `parent_id`, `user_id`, `message_id`,
+`timestamp` (the message's own) and `dropped`. The ids are strings.
+`parent_id` is the parent channel when `channel_id` is a thread the state cache
+knows, and `null` otherwise. The state cache must be on (`STATE_ENABLED`) for
+parent ids: with it off `parent_id` is always `null`, and so it is when Redis
+cannot be read (counted in `state_update_errors{reason="parent"}`). `dropped` is
+how many messages of the same (guild, user) pair the window dropped since the
+previous one that was published (0 without a window, and when the pair's count
+waited twice the window or longer). A `MESSAGE_CREATE` that cannot be read into
+this shape, or that the filter cannot read, is not published, so that
+consumers see one shape: it completes its sequence number like a filtered
+message, is logged (rate limited) and counted in `gateway_compact_unreadable`.
+Other events are published whole.
+
 ### Operations
 
 - `GET /metrics` (Prometheus) and `GET /healthcheck` on `PROMETHEUS_HOST:PROMETHEUS_PORT`.

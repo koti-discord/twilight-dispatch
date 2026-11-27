@@ -1,6 +1,7 @@
 //! Discord gateway: shard creation, the identify queue, per-shard runners,
 //! their guild member requests and ordered workers.
 
+pub mod chat_filter;
 pub mod members;
 pub mod payload;
 pub mod queue;

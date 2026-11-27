@@ -8,8 +8,9 @@
 //! became optional or were added (see `.env.example`).
 
 use serde::de::DeserializeOwned;
-use std::{fmt, time::Duration};
+use std::{collections::HashSet, fmt, time::Duration};
 use twilight_model::gateway::{
+    event::EventType,
     presence::{ActivityType, Status},
     Intents,
 };
@@ -40,6 +41,19 @@ pub struct Config {
     /// as published only once the broker confirmed it. Off by default, because
     /// with confirms each worker waits for one broker disk sync per event.
     pub amqp_confirms: bool,
+    /// The dispatch events to publish (`PUBLISH_EVENTS`, a comma-separated list
+    /// of event names such as `MESSAGE_CREATE`). `None` (unset, the default)
+    /// publishes every event. Events not listed are still cached and their
+    /// sequence still completes; they are only not published.
+    pub publish_events: Option<HashSet<String>>,
+    /// The chat source filter: `None` unless `CHAT_FILTER=true`, then its
+    /// settings (the window `CHAT_FILTER_WINDOW_SECS`, default 0: no per-pair
+    /// window, and the compact payload `COMPACT_MESSAGE_CREATE`, which needs
+    /// the filter).
+    /// `MESSAGE_CREATE` events from bots, webhooks and DMs, system messages,
+    /// and repeats of a (guild, user) pair inside the window are then not
+    /// published. They are still cached and their sequence still completes.
+    pub chat_filter: Option<ChatFilterConfig>,
     /// Whether shards resume the sessions saved in Redis by the previous run
     /// (`RESUME`, default `true`). Only when `SHARDS_TOTAL` is set and the
     /// same as in that run.
@@ -107,6 +121,18 @@ pub struct Config {
     /// Posting the bot's server and shard counts to top.gg (`TOPGG_TOKEN`,
     /// `TOPGG_INTERVAL_SECS`); `None` when `TOPGG_TOKEN` is unset.
     pub topgg: Option<TopggConfig>,
+}
+
+/// What `CHAT_FILTER=true` turns on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChatFilterConfig {
+    /// How long after a published message the same (guild, user) pair's next
+    /// ones are dropped (`CHAT_FILTER_WINDOW_SECS`, default 0: no window).
+    pub window: Duration,
+    /// Publish `MESSAGE_CREATE` as the compact body (`COMPACT_MESSAGE_CREATE`,
+    /// default `false`). The body has no author or bot flag, so it is only
+    /// allowed with the filter that drops bots.
+    pub compact: bool,
 }
 
 /// A REST proxy address as twilight-http takes it.
@@ -418,6 +444,8 @@ impl Config {
             });
         }
         let prometheus_host = env.prometheus_host()?;
+        let publish_events = env.publish_events()?;
+        let chat_filter = env.chat_filter()?;
 
         Ok(Self {
             bot_token: env.required_string("BOT_TOKEN")?,
@@ -425,6 +453,8 @@ impl Config {
             shards_concurrency: env.optional("SHARDS_CONCURRENCY")?,
             default_queue: env.optional("DEFAULT_QUEUE")?.unwrap_or(true),
             amqp_confirms: env.optional("AMQP_CONFIRMS")?.unwrap_or(false),
+            publish_events,
+            chat_filter,
             resume: env.optional("RESUME")?.unwrap_or(true),
             intents,
             large_threshold,
@@ -511,6 +541,58 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Warnings about `PUBLISH_EVENTS` and the chat filter settings that
+    /// [`Config::from_lookup`] accepts, for the log at startup: an event name
+    /// twilight does not know (a typo never matches, though a Discord event
+    /// this build does not model is published as usual), and a
+    /// `CHAT_FILTER_WINDOW_SECS` that does nothing because `CHAT_FILTER` is
+    /// not on.
+    pub fn filter_warnings(lookup: Lookup<'_>) -> Vec<String> {
+        let env = Env(lookup);
+        let mut warnings = Vec::new();
+        if let Some(value) = env.string("PUBLISH_EVENTS") {
+            for name in value.split(',').map(str::trim) {
+                if !is_event_name(name) {
+                    continue;
+                }
+                if NEVER_DISPATCHED.contains(&name) {
+                    warnings.push(format!(
+                        "PUBLISH_EVENTS lists {name}, which is never the type of a dispatched \
+                         event, so it matches nothing"
+                    ));
+                } else if EventType::try_from(name).is_err() {
+                    warnings.push(format!(
+                        "PUBLISH_EVENTS lists {name}, which is not an event this build \
+                         knows: events of that name are published, but check it for a typo"
+                    ));
+                }
+            }
+        }
+        let on = env.optional::<bool>("CHAT_FILTER").ok().flatten();
+        if env.string("CHAT_FILTER_WINDOW_SECS").is_some() && on != Some(true) {
+            warnings.push(
+                "CHAT_FILTER_WINDOW_SECS is set but CHAT_FILTER is not true, so it does nothing"
+                    .to_owned(),
+            );
+        }
+        warnings
+    }
+}
+
+/// Names in twilight's event table that never arrive as the type (`t`) of a
+/// dispatch: its own name for an unavailable guild, and the gateway's own
+/// opcodes. Listing one in `PUBLISH_EVENTS` matches nothing.
+const NEVER_DISPATCHED: &[&str] = &[
+    "UNAVAILABLE_GUILD",
+    "GATEWAY_CLOSE",
+    "GATEWAY_HEARTBEAT",
+    "GATEWAY_HEARTBEAT_ACK",
+    "GATEWAY_HELLO",
+    "GATEWAY_INVALIDATE_SESSION",
+    "GATEWAY_RECONNECT",
+];
+
 /// Reported at startup when set, so deployments learn they can drop them.
 const OBSOLETE_VARIABLES: &[&str] = &["CLUSTERS", "SHARDS_WAIT"];
 
@@ -545,6 +627,62 @@ impl Env<'_> {
     /// blank.
     fn required<T: DeserializeOwned>(&self, name: &'static str) -> Result<T, ConfigError> {
         self.optional(name)?.ok_or(ConfigError::Missing(name))
+    }
+
+    /// `PUBLISH_EVENTS`: the names of the dispatch events to publish, or `None`
+    /// when it is unset or blank. Every entry must look like the name of a
+    /// dispatch event (`A-Z`, `0-9` and `_`), so an empty entry (a stray
+    /// comma) and a name with other characters are errors. A well-formed
+    /// name twilight does not know is accepted, as this gateway passes on
+    /// events twilight does not model; [`Config::filter_warnings`] reports it
+    /// at startup, so a typo is seen.
+    fn publish_events(&self) -> Result<Option<HashSet<String>>, ConfigError> {
+        let Some(value) = self.string("PUBLISH_EVENTS") else {
+            return Ok(None);
+        };
+        let mut names = HashSet::new();
+        for name in value.split(',').map(str::trim) {
+            if name.is_empty() {
+                return Err(ConfigError::Invalid {
+                    name: "PUBLISH_EVENTS",
+                    value,
+                    reason: "empty event name (a stray comma?)".into(),
+                });
+            }
+            if !is_event_name(name) {
+                return Err(ConfigError::Invalid {
+                    name: "PUBLISH_EVENTS",
+                    value: name.to_owned(),
+                    reason: "not the name of a Discord dispatch event: expected capital \
+                             letters, digits and underscores, such as MESSAGE_CREATE"
+                        .into(),
+                });
+            }
+            names.insert(name.to_owned());
+        }
+        Ok(Some(names))
+    }
+
+    /// `CHAT_FILTER`, `CHAT_FILTER_WINDOW_SECS` and `COMPACT_MESSAGE_CREATE`: the
+    /// settings when the filter is on. The values are checked, as every other
+    /// value, with the filter off too.
+    fn chat_filter(&self) -> Result<Option<ChatFilterConfig>, ConfigError> {
+        let on = self.optional("CHAT_FILTER")?.unwrap_or(false);
+        let secs: u64 = self.optional("CHAT_FILTER_WINDOW_SECS")?.unwrap_or(0);
+        let compact = self.optional("COMPACT_MESSAGE_CREATE")?.unwrap_or(false);
+        if compact && !on {
+            return Err(ConfigError::Invalid {
+                name: "COMPACT_MESSAGE_CREATE",
+                value: self.string("COMPACT_MESSAGE_CREATE").unwrap_or_default(),
+                reason: "needs CHAT_FILTER=true: the compact body has no author or bot flag, \
+                         so without the filter a consumer cannot tell bot messages apart"
+                    .into(),
+            });
+        }
+        Ok(on.then(|| ChatFilterConfig {
+            window: Duration::from_secs(secs),
+            compact,
+        }))
     }
 
     /// `SHARDS_START`, `SHARDS_END` and `SHARDS_TOTAL`: `None` when all three
@@ -734,6 +872,15 @@ impl Env<'_> {
             }),
         }
     }
+}
+
+/// Whether `name` is made like the name of a dispatch event (`MESSAGE_CREATE`):
+/// capital letters, digits and underscores.
+fn is_event_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 /// An IP address, or `localhost` (accepted by earlier versions' examples).
@@ -1098,6 +1245,173 @@ pub(crate) mod tests {
                 }
                 other => panic!("{changes:?} -> {other:?}"),
             }
+        }
+    }
+
+    /// `PUBLISH_EVENTS` is unset (everything is published), a trimmed list of
+    /// dispatch event names, or an error that names the offending entry.
+    #[test]
+    fn publish_events_is_a_list_of_dispatch_event_names() {
+        assert_eq!(with(&[]).unwrap().publish_events, None);
+        assert_eq!(
+            with(&[("PUBLISH_EVENTS", "  ")]).unwrap().publish_events,
+            None
+        );
+
+        let listed = with(&[(
+            "PUBLISH_EVENTS",
+            "MESSAGE_CREATE, GUILD_CREATE ,MESSAGE_CREATE",
+        )])
+        .unwrap()
+        .publish_events
+        .unwrap();
+        let expected: HashSet<String> =
+            ["MESSAGE_CREATE", "GUILD_CREATE"].map(str::to_owned).into();
+        assert_eq!(listed, expected);
+
+        // Well-formed names twilight does not model are accepted: this
+        // gateway passes such events on when the variable is unset.
+        let accepted = with(&[("PUBLISH_EVENTS", "GUILD_STICKERS_UPDATE,MADE_UP_EVENT_2")])
+            .unwrap()
+            .publish_events
+            .unwrap();
+        let expected: HashSet<String> = ["GUILD_STICKERS_UPDATE", "MADE_UP_EVENT_2"]
+            .map(str::to_owned)
+            .into();
+        assert_eq!(accepted, expected);
+
+        for value in [
+            "message_create",
+            "MESSAGE-CREATE",
+            "MESSAGE CREATE",
+            "MESSAGE_CREATE.",
+            "MESSAGE_CREATE,",
+            ",",
+            "A,,B",
+        ] {
+            assert_invalid("PUBLISH_EVENTS", &[("PUBLISH_EVENTS", value)]);
+        }
+        let error = with(&[("PUBLISH_EVENTS", "MESSAGE_CREATE,nope")]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid environment variable PUBLISH_EVENTS=\"nope\": not the name of a \
+             Discord dispatch event: expected capital letters, digits and underscores, \
+             such as MESSAGE_CREATE"
+        );
+        let error = with(&[("PUBLISH_EVENTS", "MESSAGE_CREATE,,GUILD_CREATE")]).unwrap_err();
+        assert!(error.to_string().contains("empty event name"), "{error}");
+    }
+
+    /// The warnings at startup: a name twilight does not know (a typo, or a
+    /// newer event), and a window that does nothing without the filter.
+    #[test]
+    fn filter_warnings_report_what_is_accepted_but_probably_wrong() {
+        let warnings = |changes: &[(&'static str, &str)]| {
+            let mut env = example_env();
+            env.extend(
+                changes
+                    .iter()
+                    .map(|&(name, value)| (name, value.to_owned())),
+            );
+            Config::filter_warnings(&|name| env.get(name).cloned())
+        };
+        assert!(warnings(&[]).is_empty());
+        assert!(warnings(&[("PUBLISH_EVENTS", "MESSAGE_CREATE, GUILD_CREATE")]).is_empty());
+
+        let unknown = warnings(&[(
+            "PUBLISH_EVENTS",
+            "MESSAGE_CREATE,MESSAGE_CREAT,GUILD_STICKERS_UPDATE",
+        )]);
+        assert_eq!(unknown.len(), 2, "{unknown:?}");
+        assert!(unknown[0].contains("MESSAGE_CREAT,"), "{unknown:?}");
+        assert!(unknown[1].contains("GUILD_STICKERS_UPDATE"), "{unknown:?}");
+
+        let never = warnings(&[(
+            "PUBLISH_EVENTS",
+            "UNAVAILABLE_GUILD,GATEWAY_HELLO,GATEWAY_RECONNECT,GUILD_CREATE",
+        )]);
+        assert_eq!(never.len(), 3, "{never:?}");
+        assert!(
+            never.iter().all(|w| w.contains("never the type")),
+            "{never:?}"
+        );
+
+        let window = warnings(&[("CHAT_FILTER_WINDOW_SECS", "30")]);
+        assert_eq!(window.len(), 1, "{window:?}");
+        assert!(window[0].contains("CHAT_FILTER_WINDOW_SECS"), "{window:?}");
+        assert_eq!(
+            warnings(&[("CHAT_FILTER", "false"), ("CHAT_FILTER_WINDOW_SECS", "30")]).len(),
+            1
+        );
+        assert!(warnings(&[("CHAT_FILTER", "true"), ("CHAT_FILTER_WINDOW_SECS", "30")]).is_empty());
+    }
+
+    fn filter(secs: u64, compact: bool) -> ChatFilterConfig {
+        ChatFilterConfig {
+            window: Duration::from_secs(secs),
+            compact,
+        }
+    }
+
+    /// The chat filter is off, without a window, unless set.
+    #[test]
+    fn chat_filter_is_off_by_default_and_takes_a_window_in_seconds() {
+        let config = with(&[]).unwrap();
+        assert_eq!(config.chat_filter, None);
+
+        let config = with(&[("CHAT_FILTER", "true"), ("CHAT_FILTER_WINDOW_SECS", "30")]).unwrap();
+        assert_eq!(config.chat_filter, Some(filter(30, false)));
+
+        let config = with(&[("CHAT_FILTER", "true")]).unwrap();
+        assert_eq!(config.chat_filter, Some(filter(0, false)));
+
+        let config = with(&[("CHAT_FILTER_WINDOW_SECS", "30")]).unwrap();
+        assert_eq!(config.chat_filter, None, "the window alone does nothing");
+
+        assert_invalid("CHAT_FILTER", &[("CHAT_FILTER", "maybe")]);
+        assert_invalid(
+            "CHAT_FILTER_WINDOW_SECS",
+            &[("CHAT_FILTER_WINDOW_SECS", "-1")],
+        );
+        assert_invalid(
+            "CHAT_FILTER_WINDOW_SECS",
+            &[("CHAT_FILTER_WINDOW_SECS", "soon")],
+        );
+    }
+
+    /// The compact payload is off by default, and only allowed with the chat
+    /// filter, which drops the bots its body cannot tell apart; the error names
+    /// both variables.
+    #[test]
+    fn the_compact_payload_needs_the_chat_filter() {
+        let on = [("CHAT_FILTER", "true"), ("COMPACT_MESSAGE_CREATE", "true")];
+        let config = with(&on).unwrap();
+        assert_eq!(config.chat_filter, Some(filter(0, true)));
+        let config = with(&[("CHAT_FILTER", "true"), ("COMPACT_MESSAGE_CREATE", "false")]).unwrap();
+        assert_eq!(config.chat_filter, Some(filter(0, false)));
+
+        for changes in [
+            &[("COMPACT_MESSAGE_CREATE", "true")][..],
+            &[("CHAT_FILTER", "false"), ("COMPACT_MESSAGE_CREATE", "true")],
+        ] {
+            let error = with(changes).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Invalid { name, .. } if *name == "COMPACT_MESSAGE_CREATE"),
+                "{error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("COMPACT_MESSAGE_CREATE"), "{message}");
+            assert!(message.contains("CHAT_FILTER=true"), "{message}");
+        }
+        assert_invalid(
+            "COMPACT_MESSAGE_CREATE",
+            &[("CHAT_FILTER", "true"), ("COMPACT_MESSAGE_CREATE", "maybe")],
+        );
+
+        // The error shows the value as it was set.
+        match with(&[("COMPACT_MESSAGE_CREATE", " true ")]) {
+            Err(ConfigError::Invalid { value, .. }) => assert_eq!(value, " true "),
+            other => panic!("{other:?}"),
         }
     }
 

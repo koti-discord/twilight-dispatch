@@ -1,12 +1,17 @@
 //! Raw gateway payload handling: envelope parsing, routing and re-publishing.
 //!
-//! The published message keeps the historical shape `{"op", "t", "d", "old"?}`.
+//! The published message keeps the historical shape `{"op", "t", "d", "old"?}`
+//! (a compact `MESSAGE_CREATE` has a `d` of its own and no `old`).
 //! `d` is passed through byte for byte (it is never re-serialized), so the
 //! queue sees exactly what Discord sent.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
 use std::borrow::Cow;
+use twilight_model::id::{
+    marker::{ChannelMarker, GuildMarker, MessageMarker, UserMarker},
+    Id,
+};
 
 /// The outer fields of a gateway payload.
 #[derive(Debug, Deserialize)]
@@ -161,12 +166,155 @@ pub fn outgoing(envelope: &Envelope<'_>, old: Option<&Value>) -> serde_json::Res
     Ok(bytes)
 }
 
+/// The fields of a `MESSAGE_CREATE`'s `d` that the compact body keeps.
+#[derive(Deserialize)]
+struct MessageFields<'a> {
+    #[serde(rename = "id")]
+    message_id: Id<MessageMarker>,
+    channel_id: Id<ChannelMarker>,
+    guild_id: Id<GuildMarker>,
+    author: Author,
+    #[serde(borrow)]
+    timestamp: Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+struct Author {
+    id: Id<UserMarker>,
+}
+
+/// The compact `d` of a `MESSAGE_CREATE` (`COMPACT_MESSAGE_CREATE`): where it
+/// was sent, by whom and when, and what the chat filter dropped before it.
+/// Ids are strings, as Discord sends them. The field order is part of the
+/// format.
+#[derive(Debug, Serialize)]
+pub struct Compact<'a> {
+    guild_id: Id<GuildMarker>,
+    channel_id: Id<ChannelMarker>,
+    /// The parent of the thread `channel_id` names; `null` when it is not a
+    /// thread the cache knows.
+    parent_id: Option<Id<ChannelMarker>>,
+    user_id: Id<UserMarker>,
+    message_id: Id<MessageMarker>,
+    timestamp: Cow<'a, str>,
+    /// Messages of this (guild, user) pair the chat filter's window dropped
+    /// since the previous one published.
+    dropped: u32,
+}
+
+impl<'a> Compact<'a> {
+    /// Read the compact fields from a `MESSAGE_CREATE`'s raw `d`, with no
+    /// parent and nothing dropped. `None` when it lacks one of them or has
+    /// one that is not what Discord sends (a DM has no `guild_id`).
+    pub fn read(data: &'a RawValue) -> Option<Self> {
+        let fields: MessageFields<'a> = serde_json::from_str(data.get()).ok()?;
+        Some(Self {
+            guild_id: fields.guild_id,
+            channel_id: fields.channel_id,
+            parent_id: None,
+            user_id: fields.author.id,
+            message_id: fields.message_id,
+            timestamp: fields.timestamp,
+            dropped: 0,
+        })
+    }
+
+    /// The guild the message was sent in.
+    pub fn guild_id(&self) -> Id<GuildMarker> {
+        self.guild_id
+    }
+
+    /// The channel (or thread) the message was sent in.
+    pub fn channel_id(&self) -> Id<ChannelMarker> {
+        self.channel_id
+    }
+
+    /// Set the thread's parent channel.
+    #[must_use]
+    pub fn with_parent(mut self, parent: Option<Id<ChannelMarker>>) -> Self {
+        self.parent_id = parent;
+        self
+    }
+
+    /// Set how many messages of the pair were dropped before this one.
+    #[must_use]
+    pub fn with_dropped(mut self, dropped: u32) -> Self {
+        self.dropped = dropped;
+        self
+    }
+}
+
+/// The compact message: the envelope's `op` and `t` with the compact `d`.
+#[derive(Serialize)]
+struct CompactOutgoing<'a> {
+    op: u8,
+    t: Option<&'a str>,
+    d: &'a Compact<'a>,
+}
+
+/// Build the message published for a `MESSAGE_CREATE` with the compact
+/// switch on: `{"op", "t", "d"}` with the compact `d` in place of Discord's.
+///
+/// # Errors
+///
+/// Returns the serializer's error. Serializing these types into memory does
+/// not fail in practice.
+pub fn compact_outgoing(
+    envelope: &Envelope<'_>,
+    compact: &Compact<'_>,
+) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&CompactOutgoing {
+        op: envelope.op,
+        t: envelope.kind(),
+        d: compact,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     const MESSAGE: &str = r#"{"t":"MESSAGE_CREATE","s":42,"op":0,"d":{"id":"5","channel_id":"3","guild_id":"7","content":"hi é","nested":{"guild_id":"999"}}}"#;
+
+    const CHAT: &str = r#"{"t":"MESSAGE_CREATE","s":42,"op":0,"d":{"id":"5","channel_id":"3","guild_id":"7","content":"hi é","timestamp":"2024-01-01T00:00:00.000000+00:00","author":{"id":"9","username":"u","bot":false},"mentions":[]}}"#;
+
+    #[test]
+    fn the_compact_body_has_the_envelope_and_seven_fields_in_order() {
+        let env = Envelope::parse(CHAT).unwrap();
+        let compact = Compact::read(env.d.unwrap()).unwrap();
+        let parent = Id::new_checked(2);
+        let body = compact_outgoing(&env, &compact.with_parent(parent).with_dropped(4)).unwrap();
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"op":0,"t":"MESSAGE_CREATE","d":{"guild_id":"7","channel_id":"3","parent_id":"2","user_id":"9","message_id":"5","timestamp":"2024-01-01T00:00:00.000000+00:00","dropped":4}}"#
+        );
+    }
+
+    #[test]
+    fn the_compact_parent_is_null_by_default() {
+        let env = Envelope::parse(CHAT).unwrap();
+        let compact = Compact::read(env.d.unwrap()).unwrap();
+        assert_eq!(compact.guild_id().get(), 7);
+        assert_eq!(compact.channel_id().get(), 3);
+        let body = compact_outgoing(&env, &compact).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["d"]["parent_id"], Value::Null);
+        assert_eq!(body["d"]["dropped"], 0);
+    }
+
+    #[test]
+    fn a_message_without_one_of_the_compact_fields_is_unreadable() {
+        for missing in ["id", "channel_id", "guild_id", "timestamp", "author"] {
+            let mut d: Value = serde_json::from_str(CHAT).unwrap();
+            d["d"].as_object_mut().unwrap().remove(missing);
+            let json = d.to_string();
+            let env = Envelope::parse(&json).unwrap();
+            assert!(Compact::read(env.d.unwrap()).is_none(), "{missing}");
+        }
+        let env = Envelope::parse(r#"{"op":0,"t":"MESSAGE_CREATE","d":[]}"#).unwrap();
+        assert!(Compact::read(env.d.unwrap()).is_none());
+    }
 
     #[test]
     fn parses_envelope() {
