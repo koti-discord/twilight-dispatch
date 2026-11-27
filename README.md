@@ -26,10 +26,12 @@ as `MESSAGE_CREATE,GUILD_CREATE,GUILD_DELETE`) limits what is published: only
 the listed events go to the exchange. Every other event is still applied to the
 state cache and still completes its sequence number, so the saved resume point
 keeps advancing; it is just not sent to the broker. Unset, every event is
-published. An empty entry, or a name with anything but capital letters, digits and
-underscores, is a configuration error. A well-formed name this build does not
-know is accepted (events twilight does not model are published when the
-variable is unset), and logged as a warning at startup so a typo is seen.
+published. An empty entry, or a name with anything but capital letters,
+digits and underscores, is a configuration error. A well-formed name this
+build does not know is accepted (events twilight does not model are published
+when the variable is unset), and logged as a warning at startup so a typo is
+seen; so are names that are never the type of a dispatched event
+(`UNAVAILABLE_GUILD`, `GATEWAY_*`).
 
 `CHAT_FILTER=true` (off by default) leaves out of the published events the
 `MESSAGE_CREATE` events that are not chat: those from bots (`author.bot`), from
@@ -43,10 +45,10 @@ with more live pairs than that, a new pair is published without being
 remembered. A drop count that waited at least twice the window for the pair's
 next message is stale and reported as 0 (see `COMPACT_MESSAGE_CREATE`). A
 message whose publish failed does not start its window: the pair's next
-message is published at once, with the count the failed one would have carried.
-Like an event left out
-by `PUBLISH_EVENTS` (which is checked first), a filtered message is still
-applied to the state cache and still completes its sequence number. They are
+message is published at once, with the count the failed one would have carried
+(if it comes within twice the window). Like an event left out by
+`PUBLISH_EVENTS` (which is checked first), a filtered message is still applied
+to the state cache and still completes its sequence number. They are
 counted in `gateway_chat_filtered{reason}` (`bot`, `webhook`, `dm`, `system`,
 `window`).
 
@@ -70,10 +72,10 @@ cannot be read (counted in `state_update_errors{reason="parent"}`). `dropped` is
 how many messages of the same (guild, user) pair the window dropped since the
 previous one that was published (0 without a window, and when the pair's count
 waited twice the window or longer). A `MESSAGE_CREATE` that cannot be read into
-this shape, or that the filter cannot read, is not published, so that consumers see one
-shape: it completes its sequence number like a filtered message, is logged
-(rate limited) and counted in `gateway_compact_unreadable`. Other events are
-published whole.
+this shape, or that the filter cannot read, is not published, so that
+consumers see one shape: it completes its sequence number like a filtered
+message, is logged (rate limited) and counted in `gateway_compact_unreadable`.
+Other events are published whole.
 
 ### Operations
 

@@ -220,7 +220,8 @@ impl ChatFilter {
     /// and drop count are what they were before it, or the pair is forgotten
     /// when that message created it. So the window does not run from a message
     /// nobody received: the pair's next message is published at once, and
-    /// carries the restored count.
+    /// carries the restored count (when it comes within twice the window; a
+    /// count older than that is reported as 0).
     ///
     /// Call it right after the failed publish, before the pair's next message
     /// is checked: one worker processes a guild's events one at a time, so

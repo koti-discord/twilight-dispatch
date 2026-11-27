@@ -552,18 +552,22 @@ impl Config {
         let env = Env(lookup);
         let mut warnings = Vec::new();
         if let Some(value) = env.string("PUBLISH_EVENTS") {
-            warnings.extend(
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|name| is_event_name(name) && EventType::try_from(*name).is_err())
-                    .map(|name| {
-                        format!(
-                            "PUBLISH_EVENTS lists {name}, which is not an event this build \
-                             knows: events of that name are published, but check it for a typo"
-                        )
-                    }),
-            );
+            for name in value.split(',').map(str::trim) {
+                if !is_event_name(name) {
+                    continue;
+                }
+                if NEVER_DISPATCHED.contains(&name) {
+                    warnings.push(format!(
+                        "PUBLISH_EVENTS lists {name}, which is never the type of a dispatched \
+                         event, so it matches nothing"
+                    ));
+                } else if EventType::try_from(name).is_err() {
+                    warnings.push(format!(
+                        "PUBLISH_EVENTS lists {name}, which is not an event this build \
+                         knows: events of that name are published, but check it for a typo"
+                    ));
+                }
+            }
         }
         let on = env.optional::<bool>("CHAT_FILTER").ok().flatten();
         if env.string("CHAT_FILTER_WINDOW_SECS").is_some() && on != Some(true) {
@@ -575,6 +579,19 @@ impl Config {
         warnings
     }
 }
+
+/// Names in twilight's event table that never arrive as the type (`t`) of a
+/// dispatch: its own name for an unavailable guild, and the gateway's own
+/// opcodes. Listing one in `PUBLISH_EVENTS` matches nothing.
+const NEVER_DISPATCHED: &[&str] = &[
+    "UNAVAILABLE_GUILD",
+    "GATEWAY_CLOSE",
+    "GATEWAY_HEARTBEAT",
+    "GATEWAY_HEARTBEAT_ACK",
+    "GATEWAY_HELLO",
+    "GATEWAY_INVALIDATE_SESSION",
+    "GATEWAY_RECONNECT",
+];
 
 /// Reported at startup when set, so deployments learn they can drop them.
 const OBSOLETE_VARIABLES: &[&str] = &["CLUSTERS", "SHARDS_WAIT"];
@@ -1308,6 +1325,16 @@ pub(crate) mod tests {
         assert_eq!(unknown.len(), 2, "{unknown:?}");
         assert!(unknown[0].contains("MESSAGE_CREAT,"), "{unknown:?}");
         assert!(unknown[1].contains("GUILD_STICKERS_UPDATE"), "{unknown:?}");
+
+        let never = warnings(&[(
+            "PUBLISH_EVENTS",
+            "UNAVAILABLE_GUILD,GATEWAY_HELLO,GATEWAY_RECONNECT,GUILD_CREATE",
+        )]);
+        assert_eq!(never.len(), 3, "{never:?}");
+        assert!(
+            never.iter().all(|w| w.contains("never the type")),
+            "{never:?}"
+        );
 
         let window = warnings(&[("CHAT_FILTER_WINDOW_SECS", "30")]);
         assert_eq!(window.len(), 1, "{window:?}");

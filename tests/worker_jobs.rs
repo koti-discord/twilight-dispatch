@@ -629,10 +629,10 @@ async fn the_compact_body_carries_the_dropped_count() {
     for seq in 2..=4 {
         worker::process(&ctx, &mut conn, message_job(&handle, seq, 3, 1)).await;
     }
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(Duration::from_millis(450)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 5, 3, 1)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 6, 3, 1)).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(Duration::from_millis(450)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 7, 3, 1)).await;
 
     let dropped: Vec<_> = recorder
@@ -648,8 +648,9 @@ async fn the_compact_body_carries_the_dropped_count() {
 /// message is published at once, with the `dropped` the failed one would have
 /// carried. The same holds for the first message of a pair.
 ///
-/// The windows are a few hundred milliseconds: the waits are between one and
-/// two windows (a count older than two is reported as 0).
+/// The windows are a few hundred milliseconds: the waits (450 ms against 400 ms
+/// windows) are between one and two windows (a count older than two is
+/// reported as 0).
 #[tokio::test]
 async fn a_failed_publish_does_not_start_the_window() {
     let _serial = SERIAL.lock().await;
@@ -669,7 +670,7 @@ async fn a_failed_publish_does_not_start_the_window() {
     worker::process(&ctx, &mut conn, message_job(&handle, 2, 3, 1)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 3, 3, 1)).await;
     worker::process(&ctx, &mut conn, message_job(&handle, 4, 3, 1)).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(Duration::from_millis(450)).await;
 
     // The next two publishes fail: user 1's third message (which would carry
     // the 2 dropped) and user 2's first.
